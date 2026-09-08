@@ -1047,6 +1047,109 @@ class BRNAnalyzer:
 
         return payload
 
+
+def fit_michel_gaussian_fwhm(centers, counts, errors):
+    """Fit Gaussian+constant in the FWHM region around a histogram peak.
+
+    Shared by the per-run Michel fit (RunProcessor._fit_michel_peak_fwhm) and
+    the standalone Michel spectrum plot (Plotter.plot_michel_spectrum) so both
+    paths use identical fitting logic.
+    """
+    centers = np.asarray(centers, dtype=float)
+    counts = np.asarray(counts, dtype=float)
+    errors = np.asarray(errors, dtype=float)
+
+    fit_summary = {
+        'success': False,
+        'peak_location': np.nan,
+        'peak_location_error': np.nan,
+        'sigma': np.nan,
+        'sigma_error': np.nan,
+        'fwhm_min': np.nan,
+        'fwhm_max': np.nan,
+        'fit_x': np.array([]),
+        'fit_y': np.array([]),
+        'raw_peak': np.nan
+    }
+
+    if centers.size < 5 or counts.size != centers.size:
+        return fit_summary
+
+    peak_idx = int(np.argmax(counts))
+    peak_count = float(counts[peak_idx])
+    fit_summary['raw_peak'] = float(centers[peak_idx])
+    if not np.isfinite(peak_count) or peak_count <= 0:
+        return fit_summary
+
+    half_max = 0.5 * peak_count
+    above_half = counts >= half_max
+    if not above_half[peak_idx]:
+        return fit_summary
+
+    left = peak_idx
+    while left > 0 and above_half[left - 1]:
+        left -= 1
+    right = peak_idx
+    while right < (len(counts) - 1) and above_half[right + 1]:
+        right += 1
+
+    x_fit = centers[left:right + 1]
+    y_fit = counts[left:right + 1]
+    e_fit = errors[left:right + 1]
+    if x_fit.size < 4:
+        return fit_summary
+
+    def gauss_plus_const(x, amp, mu, sigma, c):
+        sigma_safe = np.maximum(sigma, 1e-12)
+        expo = np.clip(-0.5 * ((x - mu) / sigma_safe) ** 2, -700, 700)
+        return amp * np.exp(expo) + c
+
+    c0 = float(max(0.0, np.min(y_fit)))
+    amp0 = float(max(np.max(y_fit) - c0, 1.0))
+    mu0 = float(centers[peak_idx])
+    fwhm_span = float(max(x_fit[-1] - x_fit[0], 1e-6))
+    sigma0 = float(max(fwhm_span / 2.355, 1e-3))
+    sigma_y = np.where(np.isfinite(e_fit) & (e_fit > 0), e_fit, 1.0)
+    x_span_total = float(max(centers[-1] - centers[0], 1e-6))
+
+    try:
+        popt, pcov = curve_fit(
+            gauss_plus_const,
+            x_fit,
+            y_fit,
+            p0=[amp0, mu0, sigma0, c0],
+            bounds=(
+                [0.0, x_fit[0], 1e-6, 0.0],
+                [np.inf, x_fit[-1], max(x_span_total, sigma0 * 10.0), np.inf]
+            ),
+            sigma=sigma_y,
+            absolute_sigma=True,
+            maxfev=100000
+        )
+        perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.array([np.nan, np.nan, np.nan, np.nan])
+        mu_fit = float(popt[1])
+        sigma_fit = float(np.abs(popt[2]))
+
+        x_line = np.linspace(x_fit[0], x_fit[-1], 200)
+        y_line = gauss_plus_const(x_line, *popt)
+
+        fit_summary.update({
+            'success': True,
+            'peak_location': mu_fit,
+            'peak_location_error': float(perr[1]),
+            'sigma': sigma_fit,
+            'sigma_error': float(perr[2]),
+            'fwhm_min': float(x_fit[0]),
+            'fwhm_max': float(x_fit[-1]),
+            'fit_x': x_line,
+            'fit_y': y_line
+        })
+    except Exception as e:
+        print(f"Warning: Michel FWHM Gaussian fit failed. Error: {e}")
+
+    return fit_summary
+
+
 class Plotter:
     """Handles all plotting operations."""
     
@@ -1257,6 +1360,77 @@ class Plotter:
         plt.savefig(save_path)
         print(f"Correlation map saved to {save_path}")
         plt.close()
+
+    def plot_michel_spectrum(self, counts, edges, img_path, pkl_path, title, M1_or_M2, logscale=False):
+        """Plot the total-P.E. (Michel electron) spectrum for a single module.
+
+        Takes an already-binned total_pe histogram (counts + edges) -- e.g. a
+        single run's histogram, or several runs' histograms summed together --
+        fits a Gaussian+constant in the FWHM window around the peak, and saves
+        a standalone spectrum plot plus the histogram/fit data.
+        """
+        counts = np.asarray(counts, dtype=float)
+        edges = np.asarray(edges, dtype=float)
+        if counts.size == 0 or edges.size < 2:
+            print(f"No Total P.E. histogram data for Michel spectrum ({title}). Skipping.")
+            return None
+
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        errors = np.sqrt(counts)
+
+        fit = fit_michel_gaussian_fwhm(centers, counts, errors)
+
+        plt.figure(figsize=(10, 6))
+        plt.errorbar(
+            centers, counts, yerr=errors, fmt='o', markersize=4, capsize=3,
+            color='black', ecolor='gray', label=f'{title} data', zorder=2
+        )
+
+        if fit['success']:
+            fit_x = np.asarray(fit['fit_x'], dtype=float)
+            fit_y = np.asarray(fit['fit_y'], dtype=float)
+            plt.plot(
+                fit_x, fit_y, color='tab:red', linewidth=2.0, zorder=3,
+                label=(
+                    f"Gaussian fit: $\\mu$={fit['peak_location']:.2f}±{fit['peak_location_error']:.2f} p.e., "
+                    f"$\\sigma$={fit['sigma']:.2f}±{fit['sigma_error']:.2f} p.e."
+                )
+            )
+            plt.axvline(
+                fit['peak_location'], color='tab:red', linestyle=':', linewidth=1.6,
+                label=f"Michel peak = {fit['peak_location']:.2f} p.e."
+            )
+            plt.axvspan(
+                fit['fwhm_min'], fit['fwhm_max'], color='tab:red', alpha=0.12,
+                label='FWHM fit window'
+            )
+
+        bin_width = float(np.median(np.diff(edges))) if edges.size > 1 else 0.0
+        plt.xlabel('Total Photoelectrons (P.E.)')
+        plt.ylabel(f'Counts per bin ({bin_width:.1f} P.E. per bin)')
+        plt.title(f'Michel Electron Spectrum: {title} ({M1_or_M2})')
+        if logscale:
+            plt.yscale('log')
+        plt.legend()
+        plt.minorticks_on()
+        plt.grid(which='major', axis='y', linestyle='-', linewidth=0.75, color='gray')
+        plt.grid(which='minor', axis='y', linestyle=':', linewidth=0.5, color='gray')
+        plt.grid(which='both', axis='x', linestyle='--', linewidth=0.5, color='gray')
+        plt.tight_layout()
+        self.file_handler.ensure_dir(img_path.parent)
+        plt.savefig(img_path)
+        plt.close()
+
+        payload = {
+            'centers': centers,
+            'counts': counts,
+            'errors': errors,
+            'michel_fit': fit,
+        }
+        self.file_handler.save_pickle(payload, pkl_path)
+        print(f"Michel electron spectrum plot saved to {img_path}")
+        print(f"Michel electron spectrum data saved to {pkl_path}")
+        return payload
 
 class RunProcessor:
     """Main class for processing individual runs."""
@@ -2559,100 +2733,12 @@ class RunProcessor:
         return main_hist_payload, pe_trig2, pe_trig2_or_34, veto_summary, michel_summary
 
     def _fit_michel_peak_fwhm(self, centers, counts, errors):
-        """Fit Gaussian+constant in the FWHM region around the histogram peak."""
-        centers = np.asarray(centers, dtype=float)
-        counts = np.asarray(counts, dtype=float)
-        errors = np.asarray(errors, dtype=float)
+        """Fit Gaussian+constant in the FWHM region around the histogram peak.
 
-        fit_summary = {
-            'success': False,
-            'peak_location': np.nan,
-            'peak_location_error': np.nan,
-            'sigma': np.nan,
-            'sigma_error': np.nan,
-            'fwhm_min': np.nan,
-            'fwhm_max': np.nan,
-            'fit_x': np.array([]),
-            'fit_y': np.array([]),
-            'raw_peak': np.nan
-        }
-
-        if centers.size < 5 or counts.size != centers.size:
-            return fit_summary
-
-        peak_idx = int(np.argmax(counts))
-        peak_count = float(counts[peak_idx])
-        fit_summary['raw_peak'] = float(centers[peak_idx])
-        if not np.isfinite(peak_count) or peak_count <= 0:
-            return fit_summary
-
-        half_max = 0.5 * peak_count
-        above_half = counts >= half_max
-        if not above_half[peak_idx]:
-            return fit_summary
-
-        left = peak_idx
-        while left > 0 and above_half[left - 1]:
-            left -= 1
-        right = peak_idx
-        while right < (len(counts) - 1) and above_half[right + 1]:
-            right += 1
-
-        x_fit = centers[left:right + 1]
-        y_fit = counts[left:right + 1]
-        e_fit = errors[left:right + 1]
-        if x_fit.size < 4:
-            return fit_summary
-
-        def gauss_plus_const(x, amp, mu, sigma, c):
-            sigma_safe = np.maximum(sigma, 1e-12)
-            expo = np.clip(-0.5 * ((x - mu) / sigma_safe) ** 2, -700, 700)
-            return amp * np.exp(expo) + c
-
-        c0 = float(max(0.0, np.min(y_fit)))
-        amp0 = float(max(np.max(y_fit) - c0, 1.0))
-        mu0 = float(centers[peak_idx])
-        fwhm_span = float(max(x_fit[-1] - x_fit[0], 1e-6))
-        sigma0 = float(max(fwhm_span / 2.355, 1e-3))
-        sigma_y = np.where(np.isfinite(e_fit) & (e_fit > 0), e_fit, 1.0)
-        x_span_total = float(max(centers[-1] - centers[0], 1e-6))
-
-        try:
-            popt, pcov = curve_fit(
-                gauss_plus_const,
-                x_fit,
-                y_fit,
-                p0=[amp0, mu0, sigma0, c0],
-                bounds=(
-                    [0.0, x_fit[0], 1e-6, 0.0],
-                    [np.inf, x_fit[-1], max(x_span_total, sigma0 * 10.0), np.inf]
-                ),
-                sigma=sigma_y,
-                absolute_sigma=True,
-                maxfev=100000
-            )
-            perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.array([np.nan, np.nan, np.nan, np.nan])
-            mu_fit = float(popt[1])
-            sigma_fit = float(np.abs(popt[2]))
-
-            x_line = np.linspace(x_fit[0], x_fit[-1], 200)
-            y_line = gauss_plus_const(x_line, *popt)
-
-            fit_summary.update({
-                'success': True,
-                'peak_location': mu_fit,
-                'peak_location_error': float(perr[1]),
-                'sigma': sigma_fit,
-                'sigma_error': float(perr[2]),
-                'fwhm_min': float(x_fit[0]),
-                'fwhm_max': float(x_fit[-1]),
-                'fit_x': x_line,
-                'fit_y': y_line
-            })
-        except Exception as e:
-            print(f"Warning: Michel FWHM Gaussian fit failed. Error: {e}")
-
-        return fit_summary
+        Delegates to the module-level fit_michel_gaussian_fwhm(), which is
+        also used by Plotter.plot_michel_spectrum(), so both paths agree.
+        """
+        return fit_michel_gaussian_fwhm(centers, counts, errors)
 
     def _fit_and_plot_low_light(self, area_data, output_dir, file_label, M1_or_M2, hist_range, hist_bins=200):
         """Plots and fits sum_area for channels 0-11 for low-light events."""
@@ -3117,6 +3203,14 @@ def main():
             FileHandler.save_pickle(
                 {'counts': aggregated['total_pe_hist'], 'edges': aggregated['total_pe_edges']},
                 output_dir / 'aggregated_total_pe_hist.pkl'
+            )
+            processor.plotter.plot_michel_spectrum(
+                aggregated['total_pe_hist'],
+                aggregated['total_pe_edges'],
+                output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_spectrum.png",
+                output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_spectrum.pkl",
+                f"Runs {start_run}-{end_run}", M1_or_M2,
+                logscale=False
             )
         if aggregated['event61_hist'] is not None and aggregated['event61_edges'] is not None:
             FileHandler.save_pickle(

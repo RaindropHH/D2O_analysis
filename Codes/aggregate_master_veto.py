@@ -1993,6 +1993,16 @@ class MasterAggregator:
                 pe_plot_cfg,
             )
 
+            if self.master_pe_counts.sum() > 0:
+                self.plotter.plot_michel_spectrum(
+                    self.master_pe_counts,
+                    self.main_pe_bin_edges,
+                    self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_spectrum.png",
+                    self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_spectrum.pkl",
+                    self.agg_label, self.m1_or_m2,
+                    logscale=False
+                )
+
     def _generate_event61_plots(self):
         """Generate the master Event61 histogram and fit plot."""
         if not self.event61_data_found and np.sum(self.master_event61_hist_counts) <= 0:
