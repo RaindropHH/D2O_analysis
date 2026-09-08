@@ -1,0 +1,22 @@
+# Python virtual environment
+d2o_env/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Regenerable analysis outputs (produced by running the scripts/notebooks)
+*.png
+*.csv
+*.pkl
+
+# Batch/submission artifacts
+globus_batch_runs_*.txt
+slurm-*.out
+
+# OS/editor cruft
+.DS_Store

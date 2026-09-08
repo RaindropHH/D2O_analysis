@@ -1,0 +1,3389 @@
+#!/usr/bin/env python3
+"""
+Master Aggregation Script for D2O Analysis (Refactored)
+
+Reads all sub-job outputs and creates final, grand-aggregated results
+using memory-efficient incremental aggregation.
+"""
+import sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import pickle
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.colors import Normalize, SymLogNorm
+from scipy.optimize import curve_fit
+import json
+from datetime import datetime
+
+# Import configuration
+import config
+
+
+MASTER_PLOT_CONFIG = getattr(config, 'MASTER_PLOT_CONFIG', {}) or {}
+
+
+def get_master_plot_config(section, defaults=None):
+    """Return one master-plot config section with optional fallback defaults."""
+    merged = {} if defaults is None else dict(defaults)
+    section_cfg = MASTER_PLOT_CONFIG.get(section, {}) if isinstance(MASTER_PLOT_CONFIG, dict) else {}
+    if isinstance(section_cfg, dict):
+        merged.update(section_cfg)
+    return merged
+
+# Import classes and functions from the refactored processing script
+from Read_Cut_Hist_D2O_multi_veto import (
+    FileHandler,
+    HistogramCalculator,
+    DataProcessor,
+    Plotter,
+    get_event61_fit_config,
+    plot_event61_histogram_payload,
+)
+
+class DataAggregator:
+    """Handles data aggregation operations."""
+    
+    def __init__(self):
+        self.file_handler = FileHandler()
+        self.hist_calc = HistogramCalculator()
+
+    def incremental_concatenate(self, master_array, new_array_path, axis=0):
+        """
+        Loads a .npy file and appends it to a master array.
+        If master_array is None, it creates it.
+        This avoids holding a large list of arrays in memory.
+        """
+        if not new_array_path.exists():
+            return master_array
+        
+        try:
+            new_data = np.load(new_array_path)
+        except (pickle.UnpicklingError, ValueError) as e:
+            print(f"  Warning: Could not load {new_array_path.name}. File may be corrupt. Error: {e}")
+            return master_array
+            
+        if new_data.size == 0:
+            return master_array
+
+        if master_array is None:
+            return new_data
+        else:
+            return np.concatenate((master_array, new_data), axis=axis)
+
+    def merge_channel_data_dicts(self, dict_list):
+        """
+        Merges a list of channel_data dictionaries from multiple runs/jobs.
+        """
+        if not dict_list:
+            return {}
+            
+        try:
+            all_channels = list(dict_list[0].keys())
+        except (IndexError, AttributeError):
+            print("Warning: BRN data list is empty or malformed.")
+            return {}
+            
+        merged = {ch: {'delta_t': [], 'area': []} for ch in all_channels}
+        
+        for d in dict_list:
+            if not isinstance(d, dict): 
+                continue
+            for ch, data in d.items():
+                if ch in merged and isinstance(data, dict):
+                    if data.get('delta_t', np.array([])).size > 0:
+                        merged[ch]['delta_t'].append(data['delta_t'])
+                    if data.get('area', np.array([])).size > 0:
+                        merged[ch]['area'].append(data['area'])
+        
+        final_merged = {}
+        for ch, data in merged.items():
+            final_merged[ch] = {
+                'delta_t': np.concatenate(data['delta_t']) if data['delta_t'] else np.array([]),
+                'area': np.concatenate(data['area']) if data['area'] else np.array([])
+            }
+        return final_merged
+
+class BinnedDataPlotter:
+    """Handles plotting operations for pre-binned data."""
+    
+    def __init__(self):
+        self.file_handler = FileHandler()
+        self.hist_calc = HistogramCalculator()
+
+    def plot_histogram_from_binned_data(self, hist_data_dict, bin_edges, img_path, title, xlabel,
+                                       M1_or_M2, logscale=True, figsize=(10, 6),
+                                       xlim=None, ylim=None, dpi=300):
+        """
+        Plots one or more overlapping histograms from pre-binned data.
+        hist_data_dict = {'label1': counts_array1, 'label2': counts_array2}
+        """
+        plt.figure(figsize=figsize)
+        outputs = {}
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        
+        for label, counts in hist_data_dict.items():
+            if counts.size > 0:
+                total_n = np.sum(counts)
+                plt.step(bin_edges, np.append(counts, counts[-1]), where='post', 
+                        label=f"{label} (N={total_n:.0f})", alpha=0.7)
+                outputs[label] = counts
+            else:
+                outputs[label] = np.zeros(len(bin_centers))
+
+        plt.xlabel(xlabel)
+        bin_width = float(np.median(np.diff(bin_edges))) if bin_edges.size > 1 else 0.0
+        plt.ylabel('Events per Bin Width ({:.2f})'.format(bin_width))
+        plt.title(f"{title} ({M1_or_M2})")
+        if logscale:
+            plt.yscale('log')
+        if xlim is not None:
+            plt.xlim(xlim)
+        if ylim is not None:
+            plt.ylim(ylim)
+        plt.legend()
+        plt.minorticks_on()
+        plt.grid(which='major', axis='y', linestyle='-', linewidth=0.75, color='gray')
+        plt.grid(which='minor', axis='y', linestyle=':', linewidth=0.5, color='gray')
+        plt.grid(which='both', axis='x', linestyle='--', linewidth=0.5, color='gray')
+        plt.tight_layout()
+        plt.savefig(img_path, dpi=dpi)
+
+        pkl_path = img_path.with_suffix('.pkl')
+        pickle_data = {'centers': bin_centers, 'histograms': outputs}
+        self.file_handler.save_pickle(pickle_data, pkl_path)
+        plt.close()
+
+    def plot_veto_efficiency_from_binned_data(self, counts_2, counts_2_or_34, bin_edges, vetorange,
+                                            img_path, pkl_path, title, M1_or_M2,
+                                            fit_range=None, y_range=None, figsize=(10, 6), dpi=300):
+        """
+        Calculates and plots veto efficiency from pre-binned counts.
+        """
+        if counts_2_or_34.sum() == 0:
+            print(f"No events for veto efficiency calculation for {title}. Skipping.")
+            return
+
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+        efficiency = np.zeros_like(counts_2, dtype=float)
+        error = np.zeros_like(counts_2, dtype=float)
+        valid_mask = counts_2_or_34 > 0
+        
+        ratio = np.divide(counts_2[valid_mask], counts_2_or_34[valid_mask])
+        efficiency[valid_mask] = 1 - ratio
+        
+        veto_range_mask = valid_mask & (bin_centers >= vetorange[0]) & (bin_centers <= vetorange[1])
+        average_efficiency = np.mean(efficiency[veto_range_mask]) if np.any(veto_range_mask) else np.nan
+
+        n = counts_2_or_34[valid_mask]
+        p = ratio
+        error[valid_mask] = np.sqrt(p * (1 - p) / n)
+        # Average-efficiency uncertainty from integrated counts in veto range.
+        k_total = float(np.sum(counts_2[veto_range_mask])) if np.any(veto_range_mask) else 0.0
+        n_total = float(np.sum(counts_2_or_34[veto_range_mask])) if np.any(veto_range_mask) else 0.0
+        if n_total > 0:
+            p_total = np.clip(k_total / n_total, 0.0, 1.0)
+            average_efficiency = 1.0 - p_total
+            err_average_efficiency = np.sqrt(p_total * (1.0 - p_total) / n_total)
+        else:
+            average_efficiency = np.nan
+            err_average_efficiency = np.nan
+
+        # --- Michel tail subtraction (fit exponential in specified range) ---
+        def exp_model(x, a, b):
+            return a * np.exp(b * x)
+
+        michel_tail_counts = np.zeros_like(counts_2, dtype=float)
+        michel_tail_variance = np.zeros_like(counts_2, dtype=float)
+        michel_fit_params = None
+        michel_fit_cov = None
+        if fit_range is None:
+            michel_fit_range = (vetorange[0] * 0.5, vetorange[1] * 0.5)
+        else:
+            michel_fit_range = tuple(fit_range)
+
+        fit_mask = (bin_centers >= michel_fit_range[0]) & (bin_centers <= michel_fit_range[1]) & (counts_2 > 0)
+        if np.count_nonzero(fit_mask) >= 2:
+            x_fit = bin_centers[fit_mask]
+            y_fit = counts_2[fit_mask]
+            try:
+                a0 = max(y_fit.max(), 1.0)
+                b0 = -1.0 / max((michel_fit_range[1] - michel_fit_range[0]), 1.0)
+                popt, pcov = curve_fit(exp_model, x_fit, y_fit, p0=(a0, b0), bounds=([0.0, -np.inf], [np.inf, 0.0]))
+                michel_fit_params = {'a': float(popt[0]), 'b': float(popt[1])}
+                michel_fit_cov = pcov.tolist()
+                michel_tail_counts = exp_model(bin_centers, *popt)
+                michel_tail_counts = np.clip(michel_tail_counts, 0.0, None)
+
+                # Propagate fit covariance to per-bin tail variance
+                if pcov is not None and np.all(np.isfinite(pcov)):
+                    exp_term = np.exp(popt[1] * bin_centers)
+                    jac_a = exp_term
+                    jac_b = popt[0] * bin_centers * exp_term
+                    michel_tail_variance = (
+                        jac_a * jac_a * pcov[0, 0]
+                        + jac_b * jac_b * pcov[1, 1]
+                        + 2.0 * jac_a * jac_b * pcov[0, 1]
+                    )
+                    michel_tail_variance = np.clip(michel_tail_variance, 0.0, None)
+            except Exception as e:
+                print(f"Warning: Michel tail fit failed for {title}. Error: {e}")
+
+        # Subtracted efficiency
+        counts_2_sub = counts_2 - michel_tail_counts
+        counts_2_sub = np.clip(counts_2_sub, 0.0, None)
+        counts_2_or_34_sub = counts_2_or_34 - michel_tail_counts
+        counts_2_or_34_sub = np.clip(counts_2_or_34_sub, 0.0, None)
+
+        label_raw = r'Raw: $\varepsilon_{\mathrm{veto}}$'
+        label_sub = r'Michel-sub: $\varepsilon_{\mathrm{veto}}$'
+
+        efficiency_sub = np.zeros_like(counts_2, dtype=float)
+        error_sub = np.zeros_like(counts_2, dtype=float)
+        valid_mask_sub = counts_2_or_34_sub > 0
+        veto_range_mask_sub = valid_mask_sub & (bin_centers >= vetorange[0]) & (bin_centers <= vetorange[1])
+        ratio_sub = np.divide(counts_2_sub[valid_mask_sub], counts_2_or_34_sub[valid_mask_sub])
+        efficiency_sub[valid_mask_sub] = 1 - ratio_sub
+
+        # Error propagation for r=(N-S)/(D-S): Use independent variables k (numerator counts) and m (counts_2_or_34 - counts_2)
+        # Ratio R = (k - S) / (k + m - S)
+        # This handles the correlation between numerator and denominator correctly (unlike treating them as independent).
+        
+        k_raw = counts_2[valid_mask_sub]
+        N_raw = counts_2_or_34[valid_mask_sub]
+        m_raw = N_raw - k_raw  # Independent 'passed' counts
+        S_val = michel_tail_counts[valid_mask_sub]
+        
+        num_sub = counts_2_sub[valid_mask_sub]       # k - S
+        denom_sub = counts_2_or_34_sub[valid_mask_sub] # N - S
+        
+        safe_denom_sq = np.maximum(denom_sub ** 2, 1e-24)
+        
+        # Partial derivatives:
+        dR_dk = m_raw / safe_denom_sq
+        dR_dm = -num_sub / safe_denom_sq
+        dR_dS = -m_raw / safe_denom_sq
+        
+        var_k = k_raw
+        var_m = m_raw
+        var_S = michel_tail_variance[valid_mask_sub]
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            var_ratio = (
+                (dR_dk ** 2) * var_k
+                + (dR_dm ** 2) * var_m
+                + (dR_dS ** 2) * var_S
+            )
+        var_ratio = np.clip(var_ratio, 0.0, None)
+        error_sub[valid_mask_sub] = np.sqrt(var_ratio)
+
+        plt.figure(figsize=figsize)
+        plt.errorbar(bin_centers[valid_mask], efficiency[valid_mask], yerr=error[valid_mask],
+                     fmt='o', capsize=3, label=label_raw, color='navy', markersize=5)
+        plt.errorbar(bin_centers[valid_mask_sub], efficiency_sub[valid_mask_sub], yerr=error_sub[valid_mask_sub],
+                 fmt='s', capsize=3, label=label_sub, color='darkorange', markersize=4)
+        
+        if not np.isnan(average_efficiency):
+            plt.axhline(average_efficiency, color='red', linestyle='--',
+                        label=f'Average Efficiency = {100*average_efficiency:.4f}% ± {100*err_average_efficiency:.4f}%')
+
+        average_efficiency_sub = np.mean(efficiency_sub[veto_range_mask_sub]) if np.any(veto_range_mask_sub) else np.nan
+        err_average_efficiency_sub = np.sqrt(np.mean(error_sub[veto_range_mask_sub]**2)) if np.any(veto_range_mask_sub) else np.nan
+        if not np.isnan(average_efficiency_sub):
+            plt.axhline(average_efficiency_sub, color='orange', linestyle=':',
+                        label=f'Average Efficiency (Michel-sub) = {100*average_efficiency_sub:.4f}% ± {100*err_average_efficiency_sub:.4f}%')
+        
+        plt.xlabel('Total Photoelectrons (P.E.)')
+        plt.ylabel('Veto Efficiency')
+        plt.title(f"{title} ({M1_or_M2})")
+        plt.xlim(vetorange)
+        if y_range is not None:
+            plt.ylim(y_range)
+        else:
+            plt.ylim(0.995, 1.002)
+        plt.grid(which='major', linestyle='-', linewidth=0.7)
+        plt.grid(which='minor', linestyle=':', linewidth=0.5)
+        plt.minorticks_on()
+        plt.tight_layout()
+        plt.legend()
+        self.file_handler.ensure_dir(img_path.parent)
+        plt.savefig(img_path, dpi=dpi)
+        plt.close()
+
+        pickle_data = {
+            'centers': bin_centers, 'efficiency': efficiency, 'error': error,
+            'efficiency_subtracted': efficiency_sub, 'error_subtracted': error_sub,
+            'counts_2': counts_2, 'counts_2_or_34': counts_2_or_34,
+            'michel_tail_counts': michel_tail_counts,
+            'michel_fit_params': michel_fit_params,
+            'michel_fit_cov': michel_fit_cov,
+            'michel_fit_range': michel_fit_range,
+            'michel_tail_variance': michel_tail_variance
+        }
+        self.file_handler.save_pickle(pickle_data, pkl_path)
+        print(f"Veto efficiency plot saved to {img_path}")
+        print(f"Veto efficiency data saved to {pkl_path}")
+
+    def plot_sipm_histograms_from_binned_data(self, hist_data, bin_edges, output_dir, label, M1_or_M2, hist_config,
+                                              suptitle=None, xlabel=None, filename_suffix=None):
+        """
+        Plots SiPM histograms from pre-binned data (dict of counts).
+        """
+        self.file_handler.ensure_dir(output_dir)
+        filename_label = label.replace(" ", "_").replace("-", "_").replace(":", "")
+
+        fig, axes = plt.subplots(3, 4, figsize=tuple(hist_config.get('figure_size', (20, 15))))
+        if suptitle is None:
+            suptitle = f'SiPM Channel Area (triggerBits>=32) - {label} ({M1_or_M2})'
+        fig.suptitle(suptitle, fontsize=16)
+        axes = axes.flatten()
+
+        sipm_hist_data = {}
+        sipm_channels = config.SIPM_CHANNELS
+        xlabel = xlabel or 'Area (ADC)'
+
+        for i, ch in enumerate(sipm_channels):
+            ax = axes[i]
+            if ch in hist_data and hist_data[ch] is not None:
+                counts = hist_data[ch]
+                total_events = np.sum(counts)
+
+                ax.step(bin_edges, np.append(counts, counts[-1]), where='post', color='darkcyan',
+                       label=f"N = {total_events:.0f}")
+
+                sipm_hist_data[ch] = {'counts': counts, 'edges': bin_edges}
+                ax.set_title(f'SiPM Channel {ch}')
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel('Events')
+                ax.grid(True, which='both', linestyle=':')
+                if hist_config.get('logscale', True):
+                    ax.set_yscale('log')
+                ax.set_xlim(hist_config['hist_range'])
+                if total_events > 0:
+                    ax.legend()
+            else:
+                ax.text(0.5, 0.5, f'Channel {ch}\nNo Data', ha='center', va='center', transform=ax.transAxes)
+                ax.set_axis_off()
+
+        for i in range(len(sipm_channels), len(axes)):
+            axes[i].set_axis_off()
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if filename_suffix is None:
+            filename_suffix = 'sipm_area_histograms'
+        base_filename = f'{filename_label}_{M1_or_M2}_{filename_suffix}'
+        img_save_path = output_dir / f'{base_filename}.png'
+        pkl_save_path = output_dir / f'{base_filename}.pkl'
+
+        plt.savefig(img_save_path, dpi=hist_config.get('dpi', 300))
+        self.file_handler.save_pickle(sipm_hist_data, pkl_save_path)
+        print(f"SiPM histograms saved to {img_save_path}")
+        print(f"SiPM histogram data saved to {pkl_save_path}")
+        plt.close(fig)
+
+    def plot_normalized_histogram_comparison_from_binned_data(self, counts1, label1, counts2, label2, 
+                                                            bin_edges, img_path, title, xlabel, 
+                                                            M1_or_M2, figsize=(10, 6), dpi=300):
+        """
+        Plots two datasets as overlapping, normalized histograms from pre-binned counts.
+        Uses a log scale on the y-axis.
+        """
+        plt.figure(figsize=figsize)
+        outputs = {}
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+        total1 = counts1.sum()
+        if total1 > 0:
+            density1 = counts1 / (total1 * np.diff(bin_edges))
+            plt.step(bin_edges, np.append(density1, density1[-1]), where='post', 
+                     label=f"{label1} (N={total1:.0f})", alpha=0.7)
+            outputs[label1] = counts1
+
+        total2 = counts2.sum()
+        if total2 > 0:
+            density2 = counts2 / (total2 * np.diff(bin_edges))
+            plt.step(bin_edges, np.append(density2, density2[-1]), where='post', linewidth=2, 
+                     label=f"{label2} (N={total2:.0f})", alpha=0.7)
+            outputs[label2] = counts2
+
+        plt.xlabel(xlabel)
+        bin_width = float(np.median(np.diff(bin_edges))) if bin_edges.size > 1 else 0.0
+        plt.ylabel(f'Normalized Events / Bin Width ({bin_width:.2f})')
+        plt.title(f"{title} ({M1_or_M2})")
+        plt.yscale('log')
+        plt.legend()
+        plt.minorticks_on()
+        plt.grid(which='major', axis='y', linestyle='-', linewidth=0.75, color='gray')
+        plt.grid(which='minor', axis='y', linestyle=':', linewidth=0.5, color='gray')
+        plt.grid(which='both', axis='x', linestyle='--', linewidth=0.5, color='gray')
+        plt.tight_layout()
+        plt.savefig(img_path, dpi=dpi)
+        
+        pkl_path = img_path.with_suffix('.pkl')
+        if outputs:
+            pickle_data = {'centers': bin_centers, 'histograms': outputs, 'edges': bin_edges}
+            self.file_handler.save_pickle(pickle_data, pkl_path)
+        
+        plt.close()
+
+    def fit_and_plot_low_light_from_binned_data(self, hist_data, bin_edges, output_dir, file_label,
+                                               M1_or_M2, hist_range, plot_config=None):
+        """
+        Plots and fits sum_area for channels 0-11 from pre-binned data.
+        """
+        def constrained_gaussians(x, a0, mu0, sig0, a1, mu1, sig1, a2, a3):
+            sig2_sq = 2 * sig1**2 - sig0**2
+            sig3_sq = 3 * sig1**2 - 2 * sig0**2
+            if sig2_sq < 0 or sig3_sq < 0: 
+                return np.inf
+            pedestal = a0 * np.exp(-0.5 * ((x - mu0) / sig0)**2)
+            spe = a1 * np.exp(-0.5 * ((x - mu1) / sig1)**2)
+            dpe = a2 * np.exp(-0.5 * ((x - 2 * mu1) / np.sqrt(sig2_sq))**2)
+            tpe = a3 * np.exp(-0.5 * ((x - 3 * mu1) / np.sqrt(sig3_sq))**2)
+            return pedestal + spe + dpe + tpe
+
+        plot_config = plot_config or {}
+        fig, axes = plt.subplots(3, 4, figsize=tuple(plot_config.get('figure_size', (20, 15))))
+        fig.suptitle(f'Low-Light Channel Area Fits ({file_label}, {M1_or_M2})', fontsize=16)
+        axes = axes.flatten()
+        
+        fit_results_data = {}
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+        for i in range(12):  # Channels 0-11
+            ax = axes[i]
+            counts = hist_data.get(i, np.zeros(len(centers)))
+
+            ax.step(bin_edges, np.append(counts, counts[-1]), where='post', label=f'Ch {i} Data', alpha=0.7)
+
+            p0 = [counts.max(), 0, 20, counts.max()/5, 100, 30, counts.max()/25, counts.max()/125]
+            try:
+                mask = counts > 0
+                if not np.any(mask):
+                    raise RuntimeError("No data to fit")
+                    
+                popt, pcov = curve_fit(constrained_gaussians, centers[mask], counts[mask], p0=p0, maxfev=10000)
+                perr = np.sqrt(np.diag(pcov))
+                fit_x = np.linspace(hist_range[0], hist_range[1], 500)
+                ax.plot(fit_x, constrained_gaussians(fit_x, *popt), 'r-', label='Fit')
+                param_text = (f'$\\mu_1$: {popt[4]:.1f} $\\pm$ {perr[4]:.1f}\n'
+                              f'$\\sigma_1$: {popt[5]:.1f} $\\pm$ {perr[5]:.1f}')
+                ax.text(0.95, 0.95, param_text, transform=ax.transAxes, fontsize=9,
+                        verticalalignment='top', horizontalalignment='right',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                fit_results_data[i] = {'counts': counts, 'edges': bin_edges, 'popt': popt, 'perr': perr}
+            except (RuntimeError, ValueError):
+                ax.text(0.5, 0.5, 'Fit Failed', transform=ax.transAxes, color='red', ha='center', va='center')
+                fit_results_data[i] = {'counts': counts, 'edges': bin_edges, 'popt': None, 'perr': None}
+
+            ax.set_title(f'Channel {i}')
+            ax.set_xlabel('Sum Area (ADC)')
+            ax.set_ylabel('Events')
+            ax.set_xlim(hist_range)
+            ax.grid(True, which='both', linestyle=':')
+            ax.legend(loc='best', fontsize='small')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        self.file_handler.ensure_dir(output_dir)
+        
+        filename_label = file_label.replace(" ", "_").replace("-", "_").replace(":", "")
+        base_filename = f'{filename_label}_{M1_or_M2}_low_light_fits'
+        img_save_path = output_dir / f'{base_filename}.png'
+        pkl_save_path = output_dir / f'{base_filename}.pkl'
+        
+        plt.savefig(img_save_path, dpi=int(plot_config.get('dpi', 300)))
+        self.file_handler.save_pickle(fit_results_data, pkl_save_path)
+        print(f"Low-light fits saved to {img_save_path}")
+        print(f"Low-light fit data saved to {pkl_save_path}")
+        plt.close(fig)
+
+    def fit_and_plot_highlight_from_binned_data(self, hist_data, bin_edges, output_dir, file_label,
+                                                M1_or_M2, hist_range,
+                                                sum_hist_counts=None, sum_bin_edges=None, sum_hist_range=None,
+                                                plot_config=None, sum_plot_config=None):
+        """Plots and fits highlight P.E. spectra for PMT channels 0-11 from pre-binned data."""
+        def gaussian(x, amp, mu, sigma, c):
+            sigma = np.maximum(sigma, 1e-6)
+            return amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2) + c
+
+        plot_config = plot_config or {}
+        sum_plot_config = sum_plot_config or {}
+        fig, axes = plt.subplots(3, 4, figsize=tuple(plot_config.get('figure_size', (20, 15))))
+        fig.suptitle(f'Highlight PMT P.E. Fits ({file_label}, {M1_or_M2})', fontsize=16)
+        axes = axes.flatten()
+
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        fit_results_data = {}
+        records = []
+
+        for i in range(12):
+            ax = axes[i]
+            counts = np.asarray(hist_data.get(i, np.zeros(len(centers))), dtype=float)
+            ax.step(bin_edges, np.append(counts, counts[-1] if len(counts) > 0 else 0), where='post', alpha=0.8, label=f'Ch {i}')
+
+            peak_pe = np.nan
+            peak_pe_err = np.nan
+            popt_out = None
+            perr_out = None
+
+            if np.any(counts > 0):
+                peak_idx = int(np.argmax(counts))
+                peak_guess = float(centers[peak_idx])
+                amp_guess = max(float(np.max(counts) - np.min(counts)), 1.0)
+                total_w = float(np.sum(counts))
+                if total_w > 1:
+                    mean_w = float(np.sum(centers * counts) / total_w)
+                    var_w = float(np.sum(counts * (centers - mean_w) ** 2) / total_w)
+                    sigma_guess = max(np.sqrt(max(var_w, 1e-6)), 0.2)
+                else:
+                    sigma_guess = 1.0
+                c_guess = float(np.min(counts))
+
+                fit_half_width = float(getattr(config, 'HIGHLIGHT_FIT_CONFIG', {}).get('fit_window_half_width_pe', 12.0))
+                min_fit_points = int(getattr(config, 'HIGHLIGHT_FIT_CONFIG', {}).get('min_fit_points', 6))
+
+                # Preferred fit region: FWHM window around peak (half-maximum crossings)
+                y_half = 0.5 * float(counts[peak_idx])
+                x_left = None
+                x_right = None
+
+                for idx_l in range(peak_idx, 0, -1):
+                    y0 = float(counts[idx_l - 1])
+                    y1 = float(counts[idx_l])
+                    if (y0 <= y_half <= y1) or (y1 <= y_half <= y0):
+                        x0 = float(centers[idx_l - 1])
+                        x1 = float(centers[idx_l])
+                        if abs(y1 - y0) > 1e-12:
+                            frac = (y_half - y0) / (y1 - y0)
+                            x_left = x0 + frac * (x1 - x0)
+                        else:
+                            x_left = x1
+                        break
+
+                for idx_r in range(peak_idx, len(counts) - 1):
+                    y0 = float(counts[idx_r])
+                    y1 = float(counts[idx_r + 1])
+                    if (y0 >= y_half >= y1) or (y1 >= y_half >= y0):
+                        x0 = float(centers[idx_r])
+                        x1 = float(centers[idx_r + 1])
+                        if abs(y1 - y0) > 1e-12:
+                            frac = (y_half - y0) / (y1 - y0)
+                            x_right = x0 + frac * (x1 - x0)
+                        else:
+                            x_right = x0
+                        break
+
+                if (x_left is not None) and (x_right is not None) and (x_right > x_left):
+                    fit_lo = max(hist_range[0], x_left)
+                    fit_hi = min(hist_range[1], x_right)
+                else:
+                    fit_lo = max(hist_range[0], peak_guess - fit_half_width)
+                    fit_hi = min(hist_range[1], peak_guess + fit_half_width)
+
+                fit_mask = (centers >= fit_lo) & (centers <= fit_hi) & (counts > 0)
+
+                if np.count_nonzero(fit_mask) >= min_fit_points:
+                    try:
+                        popt, pcov = curve_fit(
+                            gaussian,
+                            centers[fit_mask],
+                            counts[fit_mask],
+                            p0=[amp_guess, peak_guess, sigma_guess, c_guess],
+                            bounds=([0.0, hist_range[0], 1e-3, 0.0], [np.inf, hist_range[1], np.inf, np.inf]),
+                            maxfev=30000
+                        )
+                        perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.full(len(popt), np.nan)
+                        peak_pe = float(popt[1])
+                        peak_pe_err = float(perr[1]) if len(perr) > 1 and np.isfinite(perr[1]) else np.nan
+                        popt_out = popt
+                        perr_out = perr
+                        x_plot = np.linspace(fit_lo, fit_hi, 300)
+                        ax.plot(x_plot, gaussian(x_plot, *popt), 'r-', linewidth=1.5, label=f'Fit peak={peak_pe:.2f} p.e.')
+                    except Exception:
+                        peak_pe = peak_guess
+                else:
+                    peak_pe = peak_guess
+
+            fit_results_data[i] = {
+                'counts': counts,
+                'edges': bin_edges,
+                'popt': popt_out,
+                'perr': perr_out,
+                'peak_pe': peak_pe,
+                'peak_pe_err': peak_pe_err,
+            }
+            records.append({'channel': i, 'peak_pe': peak_pe, 'peak_pe_err': peak_pe_err})
+
+            if np.isfinite(peak_pe):
+                ax.text(0.98, 0.95, f'Peak={peak_pe:.2f} p.e.', transform=ax.transAxes,
+                        ha='right', va='top', fontsize=9,
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.6))
+            ax.set_title(f'Channel {i}')
+            ax.set_xlabel('P.E. (Area / $\\mu_1$)')
+            ax.set_ylabel('Events')
+            ax.set_xlim(hist_range)
+            ax.grid(True, which='both', linestyle=':')
+            ax.legend(loc='best', fontsize='medium')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        self.file_handler.ensure_dir(output_dir)
+
+        filename_label = file_label.replace(" ", "_").replace("-", "_").replace(":", "")
+        base_filename = f'{filename_label}_{M1_or_M2}_highlight_pe_fits_master'
+        img_save_path = output_dir / f'{base_filename}.png'
+        pkl_save_path = output_dir / f'{base_filename}.pkl'
+        summary_pkl_path = output_dir / f'{base_filename}_summary.pkl'
+        summary_csv_path = output_dir / f'{base_filename}_summary.csv'
+
+        plt.savefig(img_save_path, dpi=int(plot_config.get('dpi', 300)))
+        self.file_handler.save_pickle(fit_results_data, pkl_save_path)
+        summary_df = pd.DataFrame(records).sort_values('channel')
+        summary_df.to_pickle(summary_pkl_path)
+        summary_df.to_csv(summary_csv_path, index=False)
+        print(f"Highlight fits saved to {img_save_path}")
+        print(f"Highlight fit data saved to {pkl_save_path}")
+        plt.close(fig)
+
+        # --- Summed highlight spectrum over PMT channels 0-11 (master aggregated) ---
+        if sum_hist_counts is not None and sum_bin_edges is not None:
+            sum_counts = np.asarray(sum_hist_counts, dtype=float)
+            sum_bin_edges = np.asarray(sum_bin_edges, dtype=float)
+            sum_centers = 0.5 * (sum_bin_edges[:-1] + sum_bin_edges[1:])
+            if sum_hist_range is None:
+                sum_hist_range = (float(sum_bin_edges[0]), float(sum_bin_edges[-1]))
+        else:
+            sum_counts = np.zeros_like(centers, dtype=float)
+            for ch in range(12):
+                sum_counts += np.asarray(hist_data.get(ch, np.zeros(len(centers))), dtype=float)
+            sum_bin_edges = np.asarray(bin_edges, dtype=float)
+            sum_centers = centers
+            if sum_hist_range is None:
+                sum_hist_range = hist_range
+
+        sum_peak_pe = np.nan
+        sum_peak_pe_err = np.nan
+        sum_sigma_pe = np.nan
+        sum_sigma_pe_err = np.nan
+        sum_popt = None
+        sum_perr = None
+        sum_fit_lo = np.nan
+        sum_fit_hi = np.nan
+
+        fit_half_width = float(getattr(config, 'HIGHLIGHT_FIT_CONFIG', {}).get('fit_window_half_width_pe', 12.0))
+        min_fit_points = int(getattr(config, 'HIGHLIGHT_FIT_CONFIG', {}).get('min_fit_points', 6))
+
+        if np.any(sum_counts > 0):
+            peak_idx = int(np.argmax(sum_counts))
+            peak_guess = float(sum_centers[peak_idx])
+            amp_guess = max(float(np.max(sum_counts) - np.min(sum_counts)), 1.0)
+            total_w = float(np.sum(sum_counts))
+            if total_w > 1:
+                mean_w = float(np.sum(sum_centers * sum_counts) / total_w)
+                var_w = float(np.sum(sum_counts * (sum_centers - mean_w) ** 2) / total_w)
+                sigma_guess = max(np.sqrt(max(var_w, 1e-6)), 0.2)
+            else:
+                sigma_guess = 1.0
+            c_guess = float(np.min(sum_counts))
+
+            y_half = 0.5 * float(sum_counts[peak_idx])
+            x_left = None
+            x_right = None
+
+            for idx_l in range(peak_idx, 0, -1):
+                y0 = float(sum_counts[idx_l - 1])
+                y1 = float(sum_counts[idx_l])
+                if (y0 <= y_half <= y1) or (y1 <= y_half <= y0):
+                    x0 = float(sum_centers[idx_l - 1])
+                    x1 = float(sum_centers[idx_l])
+                    if abs(y1 - y0) > 1e-12:
+                        frac = (y_half - y0) / (y1 - y0)
+                        x_left = x0 + frac * (x1 - x0)
+                    else:
+                        x_left = x1
+                    break
+
+            for idx_r in range(peak_idx, len(sum_counts) - 1):
+                y0 = float(sum_counts[idx_r])
+                y1 = float(sum_counts[idx_r + 1])
+                if (y0 >= y_half >= y1) or (y1 >= y_half >= y0):
+                    x0 = float(sum_centers[idx_r])
+                    x1 = float(sum_centers[idx_r + 1])
+                    if abs(y1 - y0) > 1e-12:
+                        frac = (y_half - y0) / (y1 - y0)
+                        x_right = x0 + frac * (x1 - x0)
+                    else:
+                        x_right = x0
+                    break
+
+            if (x_left is not None) and (x_right is not None) and (x_right > x_left):
+                sum_fit_lo = max(sum_hist_range[0], x_left)
+                sum_fit_hi = min(sum_hist_range[1], x_right)
+            else:
+                sum_fit_lo = max(sum_hist_range[0], peak_guess - fit_half_width)
+                sum_fit_hi = min(sum_hist_range[1], peak_guess + fit_half_width)
+
+            fit_mask = (sum_centers >= sum_fit_lo) & (sum_centers <= sum_fit_hi) & (sum_counts > 0)
+            if np.count_nonzero(fit_mask) >= min_fit_points:
+                try:
+                    popt, pcov = curve_fit(
+                        gaussian,
+                        sum_centers[fit_mask],
+                        sum_counts[fit_mask],
+                        p0=[amp_guess, peak_guess, sigma_guess, c_guess],
+                        bounds=([0.0, sum_hist_range[0], 1e-3, 0.0], [np.inf, sum_hist_range[1], np.inf, np.inf]),
+                        maxfev=30000
+                    )
+                    perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.full(len(popt), np.nan)
+                    sum_popt = popt
+                    sum_perr = perr
+                    sum_peak_pe = float(popt[1])
+                    sum_sigma_pe = float(popt[2])
+                    sum_peak_pe_err = float(perr[1]) if len(perr) > 1 and np.isfinite(perr[1]) else np.nan
+                    sum_sigma_pe_err = float(perr[2]) if len(perr) > 2 and np.isfinite(perr[2]) else np.nan
+                except Exception:
+                    sum_peak_pe = peak_guess
+            else:
+                sum_peak_pe = peak_guess
+
+        sum_fig, sum_ax = plt.subplots(figsize=tuple(sum_plot_config.get('figure_size', (10, 6))))
+        sum_ax.step(
+            sum_bin_edges,
+            np.append(sum_counts, sum_counts[-1] if len(sum_counts) > 0 else 0),
+            where='post',
+            alpha=0.9,
+            label=f'Sum over 12 PMTs, N={int(np.sum(sum_counts))}'
+        )
+        if np.isfinite(sum_fit_lo) and np.isfinite(sum_fit_hi) and (sum_fit_hi > sum_fit_lo):
+            sum_ax.axvspan(sum_fit_lo, sum_fit_hi, color='gray', alpha=0.18,
+                           label=f'Fit window [{sum_fit_lo:.1f}, {sum_fit_hi:.1f}] p.e.')
+        if sum_popt is not None:
+            x_plot = np.linspace(sum_fit_lo, sum_fit_hi, 300)
+            sum_ax.plot(
+                x_plot,
+                gaussian(x_plot, *sum_popt),
+                'r-',
+                linewidth=1.6,
+                label=(
+                    f'Gaussian fit: $\\mu$={sum_peak_pe:.2f}±{sum_peak_pe_err:.2f} p.e., '
+                    f'$\\sigma$={sum_sigma_pe:.2f}±{sum_sigma_pe_err:.2f} p.e.'
+                )
+            )
+        elif np.isfinite(sum_peak_pe):
+            sum_ax.axvline(sum_peak_pe, color='red', linestyle='--',
+                           label=f'Peak estimate: {sum_peak_pe:.2f} p.e.')
+
+        sum_ax.set_title(f'Highlight PMT P.E. Sum(Ch0-11) Master ({file_label}, {M1_or_M2})')
+        sum_ax.set_xlabel('Total P.E. (sum over 12 PMTs)')
+        sum_ax.set_ylabel('Events')
+        sum_ax.set_xlim(sum_hist_range)
+        sum_ax.grid(True, which='both', linestyle=':')
+        sum_ax.legend(loc='best', fontsize='small')
+        sum_fig.tight_layout()
+
+        sum_base_filename = f'{filename_label}_{M1_or_M2}_highlight_pe_sum12_fit_master'
+        sum_img_save_path = output_dir / f'{sum_base_filename}.png'
+        sum_pkl_save_path = output_dir / f'{sum_base_filename}.pkl'
+        sum_summary_csv_path = output_dir / f'{sum_base_filename}_summary.csv'
+        sum_summary_pkl_path = output_dir / f'{sum_base_filename}_summary.pkl'
+
+        sum_fig.savefig(sum_img_save_path, dpi=int(sum_plot_config.get('dpi', 300)))
+        plt.close(sum_fig)
+
+        sum_pickle_data = {
+            'counts': sum_counts,
+            'edges': sum_bin_edges,
+            'popt': sum_popt,
+            'perr': sum_perr,
+            'peak_pe': sum_peak_pe,
+            'peak_pe_err': sum_peak_pe_err,
+            'sigma_pe': sum_sigma_pe,
+            'sigma_pe_err': sum_sigma_pe_err,
+            'fit_window': [float(sum_fit_lo), float(sum_fit_hi)],
+            'n_events': int(np.sum(sum_counts)),
+        }
+        self.file_handler.save_pickle(sum_pickle_data, sum_pkl_save_path)
+        sum_summary_df = pd.DataFrame([
+            {
+                'peak_pe': sum_peak_pe,
+                'peak_pe_err': sum_peak_pe_err,
+                'sigma_pe': sum_sigma_pe,
+                'sigma_pe_err': sum_sigma_pe_err,
+                'fit_window_min': float(sum_fit_lo),
+                'fit_window_max': float(sum_fit_hi),
+                'n_events': int(np.sum(sum_counts)),
+            }
+        ])
+        sum_summary_df.to_csv(sum_summary_csv_path, index=False)
+        sum_summary_df.to_pickle(sum_summary_pkl_path)
+        print(f"Highlight 12-channel summed fit saved to {sum_img_save_path}")
+        print(f"Highlight 12-channel summed fit data saved to {sum_pkl_save_path}")
+
+# Simplified aggregate_plots function for compatibility
+def aggregate_plots(aggregated_data, output_dir, m1_or_m2, agg_label, dt_plot_cfg, pe_plot_cfg):
+    """Simplified aggregate plots function."""
+    print(f"Generating aggregate plots for {agg_label}")
+
+    dt_counts = np.asarray(aggregated_data.get('delta_t_hist', []), dtype=float)
+    dt_edges = np.asarray(aggregated_data.get('delta_t_edges', []), dtype=float)
+    pe_counts = np.asarray(aggregated_data.get('total_pe_hist', []), dtype=float)
+    pe_edges = np.asarray(aggregated_data.get('total_pe_edges', []), dtype=float)
+
+    if dt_counts.size == 0 or dt_edges.size < 2:
+        print("No delta_t data to plot")
+        return
+
+    # Create basic plots - this is a placeholder implementation
+    # You would need to implement the full plotting logic here
+    plotter = Plotter()
+
+    dt_range = tuple(dt_plot_cfg['range'])
+    dt_bin_width = int(dt_plot_cfg['bin_width_ns'])
+    dt_logscale = bool(dt_plot_cfg.get('logscale', True))
+    dt_figsize = tuple(dt_plot_cfg.get('figure_size', (10, 6)))
+    dt_dpi = int(dt_plot_cfg.get('dpi', 300))
+    fit_window = tuple(dt_plot_cfg.get('fit_window', dt_range))
+    do_tau_fit = bool(dt_plot_cfg.get('do_tau_fit', True))
+
+    pe_range = tuple(pe_plot_cfg['range'])
+    pe_bins_spec = pe_plot_cfg['bins']
+    pe_fit_range = tuple(pe_plot_cfg.get('fit_range', (pe_range[0], pe_range[1])))
+    pe_logscale = bool(pe_plot_cfg.get('logscale', True))
+    pe_figsize = tuple(pe_plot_cfg.get('figure_size', (10, 6)))
+    pe_dpi = int(pe_plot_cfg.get('dpi', 300))
+
+    dt_centers = 0.5 * (dt_edges[:-1] + dt_edges[1:])
+    dt_err = np.sqrt(dt_counts)
+
+    t0 = float(fit_window[0])
+
+    def dt_exp_model(t, A, tau, c):
+        tau_safe = np.maximum(tau, 1e-12)
+        expo = np.clip(-1.0 * (t - t0) / tau_safe, -700, 700)
+        return A * np.exp(expo) + c
+
+    dt_fit_params = None
+    dt_fit_stats = None
+    dt_fit_curve = None
+
+    if do_tau_fit:
+        fit_mask = (dt_centers >= fit_window[0]) & (dt_centers <= fit_window[1]) & (dt_counts > 0)
+        if np.count_nonzero(fit_mask) >= 4:
+            x_fit = dt_centers[fit_mask]
+            y_fit = dt_counts[fit_mask].astype(float)
+            sigma_fit = np.sqrt(np.maximum(y_fit, 1.0))
+
+            p0_A = max(float(np.max(y_fit) - np.min(y_fit)), 1.0)
+            p0_tau = max(float(fit_window[1] - fit_window[0]) / 2.0, 1.0)
+            p0_c = max(float(np.min(y_fit)), 0.0)
+
+            try:
+                popt, pcov = curve_fit(
+                    dt_exp_model,
+                    x_fit,
+                    y_fit,
+                    p0=(p0_A, p0_tau, p0_c),
+                    sigma=sigma_fit,
+                    absolute_sigma=True,
+                    bounds=([0.0, 1e-9, 0.0], [np.inf, np.inf, np.inf]),
+                    maxfev=20000,
+                )
+                perr = np.sqrt(np.diag(pcov))
+
+                dt_fit_curve = dt_exp_model(dt_centers, *popt)
+                dt_fit_curve = np.clip(dt_fit_curve, 0.0, None)
+
+                y_pred_fit = dt_exp_model(x_fit, *popt)
+                chi2 = float(np.sum(((y_fit - y_pred_fit) / sigma_fit) ** 2))
+                dof = int(len(y_fit) - len(popt))
+                red_chi2 = chi2 / dof if dof > 0 else np.nan
+
+                dt_fit_params = {
+                    'A': float(popt[0]),
+                    'tau': float(popt[1]),
+                    'c': float(popt[2]),
+                    't0': t0,
+                    'A_err': float(perr[0]),
+                    'tau_err': float(perr[1]),
+                    'c_err': float(perr[2]),
+                }
+                dt_fit_stats = {
+                    'chi2': chi2,
+                    'dof': dof,
+                    'red_chi2': float(red_chi2) if np.isfinite(red_chi2) else np.nan,
+                    'fit_window': [float(fit_window[0]), float(fit_window[1])],
+                }
+            except Exception as e:
+                print(f"Warning: Exponential fit failed for aggregated delta_t. Error: {e}")
+        else:
+            print("Warning: Not enough non-zero Delta T bins in fit window for tau fit.")
+
+    plt.figure(figsize=dt_figsize)
+    plt.errorbar(dt_centers, dt_counts, yerr=dt_err, fmt='o', label=agg_label, markersize=5, zorder=2)
+    if do_tau_fit:
+        plt.axvspan(fit_window[0], fit_window[1], color='gray', alpha=0.2, label='Fit Window')
+    if dt_fit_curve is not None and dt_fit_params is not None and dt_fit_stats is not None:
+        red = dt_fit_stats['red_chi2']
+        fit_label = (
+            r'Fit: $A\exp\left(-(t-t_0)/\tau\right)+c$'
+            + '\n'
+            + rf'$\tau={dt_fit_params["tau"]:.1f}\pm{dt_fit_params["tau_err"]:.1f}\ \mathrm{{ns}},\ '\
+              rf'\chi^2/\mathrm{{DOF}}={red:.2f}$'
+        )
+        plt.plot(dt_centers, dt_fit_curve, 'r-', linewidth=1.8, label=fit_label, zorder=3)
+
+    plt.xlabel('Delta T (ns)')
+    bin_width_dt = float(np.median(np.diff(dt_edges))) if dt_edges.size > 1 else 0.0
+    plt.ylabel(f'Counts per bin ({bin_width_dt:.1f} ns per bin)')
+    plt.title(f"Aggregated Delta T {agg_label} ({m1_or_m2})")
+    if dt_logscale:
+        plt.yscale('log')
+        plt.ylim(bottom=0.8)
+    plt.legend()
+    plt.minorticks_on()
+    plt.grid(which='major', axis='y', linestyle='-', linewidth=0.75, color='gray')
+    plt.grid(which='minor', axis='y', linestyle=':', linewidth=0.5, color='gray')
+    plt.grid(which='both', axis='x', linestyle='--', linewidth=0.5, color='gray')
+    plt.tight_layout()
+    dt_img_path = output_dir / f"aggregated_delta_t_{m1_or_m2}.png"
+    plt.savefig(dt_img_path, dpi=dt_dpi)
+    plt.close()
+
+    dt_pkl_path = dt_img_path.with_suffix('.pkl')
+    dt_pickle_data = {
+        'centers': dt_centers,
+        'histograms': {agg_label: dt_counts},
+        'errors': {agg_label: dt_err},
+        'fit_model': 'A*exp(-(t-t0)/tau)+c',
+        'fit_params': dt_fit_params,
+        'fit_stats': dt_fit_stats,
+    }
+    plotter.file_handler.save_pickle(dt_pickle_data, dt_pkl_path)
+    
+    if pe_counts.size == 0 or pe_edges.size < 2:
+        print("No total_pe histogram data to plot")
+        return
+
+    pe_centers = 0.5 * (pe_edges[:-1] + pe_edges[1:])
+    pe_err = np.sqrt(pe_counts)
+
+    # Exponential fit for aggregated total PE
+    def exp_model(x, a, b):
+        return a * np.exp(b * x)
+
+    fit_range = pe_fit_range
+    fit_mask = (pe_counts > 0) & (pe_centers >= fit_range[0]) & (pe_centers <= fit_range[1])
+    fit_params = None
+    fit_curve = None
+    if np.count_nonzero(fit_mask) >= 2:
+        x_fit = pe_centers[fit_mask]
+        y_fit = pe_counts[fit_mask]
+        try:
+            a0 = max(y_fit.max(), 1.0)
+            b0 = -1.0 / max((pe_centers.max() - pe_centers.min()), 1.0)
+            popt, _ = curve_fit(
+                exp_model,
+                x_fit,
+                y_fit,
+                p0=(a0, b0),
+                bounds=([0.0, -np.inf], [np.inf, 0.0])
+            )
+            fit_params = {'a': float(popt[0]), 'b': float(popt[1])}
+            pe_centers_fit = pe_centers[fit_mask]
+            fit_curve = exp_model(pe_centers_fit, *popt)
+            fit_curve = np.clip(fit_curve, 0.0, None)
+        except Exception as e:
+            print(f"Warning: Exponential fit failed for aggregated total PE. Error: {e}")
+
+    plt.figure(figsize=pe_figsize)
+    plt.errorbar(pe_centers, pe_counts, yerr=pe_err, fmt='o', label=agg_label, markersize=5, zorder=2)
+    if fit_curve is not None:
+        plt.plot(pe_centers_fit, fit_curve, 'r-', label='Exp fit, a={:.2f}, b={:.2f}'.format(fit_params['a'], fit_params['b']), zorder=3)
+    # Shade veto-efficiency fit window
+    plt.axvspan(fit_range[0], fit_range[1], color='gray', alpha=0.3, label='Fit Window')
+    plt.xlabel('Total P.E.')
+    bin_width_pe = float(np.median(np.diff(pe_edges))) if pe_edges.size > 1 else 0.0
+    plt.ylabel(f'Counts per bin ({bin_width_pe:.1f} P.E. per bin)')
+    plt.title(f"Aggregated Total PE {agg_label} ({m1_or_m2})")
+    if pe_logscale:
+        plt.yscale('log')
+        plt.ylim(bottom=0.8)
+    plt.legend()
+    plt.minorticks_on()
+    plt.grid(which='major', axis='y', linestyle='-', linewidth=0.75, color='gray')
+    plt.grid(which='minor', axis='y', linestyle=':', linewidth=0.5, color='gray')
+    plt.grid(which='both', axis='x', linestyle='--', linewidth=0.5, color='gray')
+    plt.tight_layout()
+    pe_img_path = output_dir / f"aggregated_total_pe_{m1_or_m2}.png"
+    plt.savefig(pe_img_path, dpi=pe_dpi)
+    plt.close()
+
+    pe_pkl_path = pe_img_path.with_suffix('.pkl')
+    pickle_data = {
+        'centers': pe_centers,
+        'histograms': {agg_label: pe_counts},
+        'errors': {agg_label: pe_err},
+        'fit_params': fit_params
+    }
+    plotter.file_handler.save_pickle(pickle_data, pe_pkl_path)
+
+class MasterAggregator:
+    """Main aggregator class for combining all sub-job results."""
+    
+    def __init__(self, top_dir_path):
+        self.top_dir = Path(top_dir_path)
+        if not self.top_dir.is_dir():
+            raise FileNotFoundError(f"Error: Directory not found at {self.top_dir}")
+
+        # Initialize helper classes
+        self.file_handler = FileHandler()
+        self.data_aggregator = DataAggregator()
+        self.binned_plotter = BinnedDataPlotter()
+        self.plotter = Plotter()
+
+        # Setup output directory
+        self.master_output_dir = self.top_dir / "MASTER_RESULTS"
+        self.file_handler.ensure_dir(self.master_output_dir)
+        print(f"Master output will be saved to: {self.master_output_dir}")
+
+        # Find sub-job directories
+        self.subjob_dirs = sorted(list(self.top_dir.glob("subjob_*")))
+        if not self.subjob_dirs:
+            raise FileNotFoundError("Error: No 'subjob_*' directories found. Did the jobs run correctly?")
+        
+        print(f"Found {len(self.subjob_dirs)} sub-job directories to aggregate.")
+        
+        # Initialize labels from directory name
+        self._initialize_labels()
+        
+        # Initialize data containers
+        self._initialize_data_containers()
+
+    def _initialize_labels(self):
+        """Initialize labels from directory name."""
+        dir_name_parts = self.top_dir.name.split('_')
+        self.run_range_str = dir_name_parts[1]
+        self.m1_or_m2 = dir_name_parts[2]
+        self.agg_label = f"Master Runs {self.run_range_str}"
+        self.filename_label = self.agg_label.replace(" ", "_").replace("-", "_")
+
+    @staticmethod
+    def _rebin_histogram_counts(source_counts, source_edges, target_edges, label):
+        """Rebin a histogram onto coarser aligned edges without revisiting raw events."""
+        source_counts = np.asarray(source_counts, dtype=float)
+        source_edges = np.asarray(source_edges, dtype=float)
+        target_edges = np.asarray(target_edges, dtype=float)
+
+        if source_edges.shape == target_edges.shape and np.allclose(source_edges, target_edges):
+            return source_counts.copy()
+
+        if source_edges.ndim != 1 or target_edges.ndim != 1 or source_edges.size < 2 or target_edges.size < 2:
+            raise ValueError(f"Invalid histogram edges for {label}.")
+
+        tol = 1e-9
+        if target_edges[0] < source_edges[0] - tol or target_edges[-1] > source_edges[-1] + tol:
+            raise ValueError(f"Target edges for {label} extend outside source histogram range.")
+
+        rebinned = np.zeros(len(target_edges) - 1, dtype=float)
+        for idx in range(len(rebinned)):
+            left = int(np.searchsorted(source_edges, target_edges[idx], side='left'))
+            right = int(np.searchsorted(source_edges, target_edges[idx + 1], side='left'))
+
+            if left >= source_edges.size or right >= source_edges.size:
+                raise ValueError(f"Target edges for {label} do not align with source histogram edges.")
+            if not np.isclose(source_edges[left], target_edges[idx], atol=tol, rtol=0.0):
+                raise ValueError(f"Left edge mismatch while rebinnning {label}.")
+            if not np.isclose(source_edges[right], target_edges[idx + 1], atol=tol, rtol=0.0):
+                raise ValueError(f"Right edge mismatch while rebinning {label}.")
+
+            rebinned[idx] = np.sum(source_counts[left:right])
+
+        return rebinned
+
+    @staticmethod
+    def _normalize_brn_delta_t_edges(source_edges, target_edges):
+        """Normalize legacy BRN dt edges that overshoot the configured upper bound by one final bin edge."""
+        source_edges = np.asarray(source_edges, dtype=float)
+        target_edges = np.asarray(target_edges, dtype=float)
+
+        if source_edges.shape == target_edges.shape and np.allclose(source_edges, target_edges):
+            return source_edges
+
+        if source_edges.shape == target_edges.shape and source_edges.size >= 2:
+            if np.allclose(source_edges[:-1], target_edges[:-1]) and source_edges[-1] > target_edges[-1]:
+                normalized = source_edges.copy()
+                normalized[-1] = target_edges[-1]
+                return normalized
+
+        return source_edges
+
+    def _initialize_data_containers(self):
+        """Initialize all data container variables."""
+        main_dt_cfg = get_master_plot_config('main_delta_t', {
+            'range': config.DELTA_T_CUT,
+            'bin_width_ns': config.DELTA_T_BIN_WIDTH_NS,
+        })
+        main_pe_cfg = get_master_plot_config('main_total_pe', {
+            'range': config.PE_CUT,
+            'bins': config.BINS,
+        })
+
+        dt_range = tuple(main_dt_cfg['range'])
+        dt_bin_width = int(main_dt_cfg.get('bin_width_ns', config.DELTA_T_BIN_WIDTH_NS))
+        self.main_dt_bin_edges = np.arange(dt_range[0], dt_range[1] + dt_bin_width, dt_bin_width)
+        if self.main_dt_bin_edges[-1] < dt_range[1]:
+            self.main_dt_bin_edges = np.append(self.main_dt_bin_edges, dt_range[1])
+        self.master_dt_counts = np.zeros(len(self.main_dt_bin_edges) - 1, dtype=float)
+
+        self.main_pe_bin_edges = self.data_aggregator.hist_calc.bin_edges_from_spec(
+            main_pe_cfg['bins'], np.array([]), tuple(main_pe_cfg['range'])
+        )
+        self.master_pe_counts = np.zeros(len(self.main_pe_bin_edges) - 1, dtype=float)
+        self.main_data_found = False
+
+        event61_cfg = get_event61_fit_config()
+        self.event61_bin_edges = np.linspace(*event61_cfg['hist_range'], event61_cfg['bins'] + 1)
+        self.master_event61_hist_counts = np.zeros(len(self.event61_bin_edges) - 1, dtype=float)
+        self.event61_data_found = False
+
+        sipm_master_cfg = get_master_plot_config('sipm_area_hist', {
+            'hist_bins': config.SIPM_HIST_CONFIG['hist_bins'],
+            'hist_range': config.SIPM_HIST_CONFIG['hist_range'],
+        })
+        comparison_cfg = get_master_plot_config('total_pe_comparison', {
+            'bins': config.BINS,
+            'range': config.PE_CUT,
+        })
+        veto_cfg = get_master_plot_config('veto_efficiency', {
+            'bins': config.VETO_BINS,
+            'range': config.VETO_RANGE,
+        })
+
+        # SiPM data
+        self.sipm_channels = config.SIPM_CHANNELS
+        self.sipm_bin_edges = np.linspace(*sipm_master_cfg['hist_range'],
+                                         int(sipm_master_cfg['hist_bins']) + 1)
+        self.master_sipm_hist_counts = {ch: np.zeros(int(sipm_master_cfg['hist_bins']))
+                                       for ch in self.sipm_channels}
+        self.sipm_data_found = False
+
+        # SiPM noise ratio data
+        noise_ratio_cfg = get_master_plot_config('sipm_noise_ratio_hist', {
+            'hist_bins': config.SIPM_NOISE_HIST_CONFIG.get('hist_bins', 100),
+            'hist_range': config.SIPM_NOISE_HIST_CONFIG.get('hist_range', (0, 5)),
+        })
+        self.noise_ratio_bin_edges = np.linspace(*noise_ratio_cfg['hist_range'],
+                                                  int(noise_ratio_cfg['hist_bins']) + 1)
+        self.master_noise_ratio_counts = {ch: np.zeros(int(noise_ratio_cfg['hist_bins']))
+                                           for ch in self.sipm_channels}
+        self.noise_ratio_data_found = False
+
+        # Veto data
+        self.pe_comp_bin_edges = self.data_aggregator.hist_calc.bin_edges_from_spec(
+            comparison_cfg['bins'], np.array([]), tuple(comparison_cfg['range']))
+        self.master_pe_comp_counts_2 = np.zeros(len(self.pe_comp_bin_edges) - 1)
+        self.master_pe_comp_counts_2_or_34 = np.zeros(len(self.pe_comp_bin_edges) - 1)
+        
+        self.veto_bin_edges = np.linspace(veto_cfg['range'][0] * 0.5, veto_cfg['range'][1], int(veto_cfg['bins']) + 1)
+        self.master_veto_counts_2 = np.zeros(int(veto_cfg['bins']))
+        self.master_veto_counts_2_or_34 = np.zeros(int(veto_cfg['bins']))
+        self.veto_data_found = False
+        
+        # Low-light data
+        self.ll_bin_edges = None
+        self.master_ll_hist_counts = None
+        self.ll_data_found = False
+
+        # Highlight data
+        self.hl_bin_edges = None
+        self.master_hl_hist_counts = None
+        self.hl_sum_bin_edges = None
+        self.master_hl_sum_counts = None
+        self.hl_data_found = False
+
+        # Thin veto data
+        self.tv_height_bin_edges = None
+        self.master_tv_muon_h_counts = None
+        self.master_tv_no_co_h_counts = None
+        self.tv_area_bin_edges = None
+        self.master_tv_muon_a_counts = None
+        self.master_tv_no_co_a_counts = None
+        self.tv_data_found = False
+
+        # BRN histogram data
+        brn_dt_cfg = get_master_plot_config('brn_delta_t', {
+            'channels': config.BRN_SIPM_CHANNELS,
+            'range': config.BRN_DELTA_T_RANGE,
+            'bin_width_ns': config.BRN_DELTA_T_BIN_WIDTH_NS,
+        })
+        brn_area_cfg = get_master_plot_config('brn_area', {
+            'channels': config.BRN_SIPM_CHANNELS,
+            'range': config.BRN_HIST_CONFIG['area_range'],
+            'bins': config.BRN_HIST_CONFIG['area_bins'],
+        })
+        brn_channels = list(brn_dt_cfg.get('channels', config.BRN_SIPM_CHANNELS))
+        brn_dt_range = tuple(brn_dt_cfg.get('range', config.BRN_DELTA_T_RANGE))
+        brn_dt_bin_width = int(brn_dt_cfg.get('bin_width_ns', config.BRN_DELTA_T_BIN_WIDTH_NS))
+        self.brn_delta_t_edges = np.arange(brn_dt_range[0], brn_dt_range[1] + brn_dt_bin_width, brn_dt_bin_width)
+        if self.brn_delta_t_edges[-1] < brn_dt_range[1]:
+            self.brn_delta_t_edges = np.append(self.brn_delta_t_edges, brn_dt_range[1])
+        elif self.brn_delta_t_edges[-1] > brn_dt_range[1]:
+            self.brn_delta_t_edges[-1] = brn_dt_range[1]
+        self.brn_area_edges = np.linspace(*tuple(brn_area_cfg.get('range', config.BRN_HIST_CONFIG['area_range'])), int(brn_area_cfg.get('bins', config.BRN_HIST_CONFIG['area_bins'])) + 1)
+        self.master_brn_hist_counts = {
+            ch: {
+                'delta_t': np.zeros(len(self.brn_delta_t_edges) - 1, dtype=float),
+                'area': np.zeros(len(self.brn_area_edges) - 1, dtype=float),
+                'delta_t_area': np.zeros((len(self.brn_delta_t_edges) - 1, len(self.brn_area_edges) - 1), dtype=float),
+            }
+            for ch in brn_channels
+        }
+        self.brn_data_found = False
+
+        # Time length data
+        self.total_timelength_ns = 0.0
+        self.total_timelength_s = 0.0
+        self.total_timelength_min = 0.0
+        self.total_beam_on_count = 0
+        self.total_brn_beam_on_count = 0
+        self.event61_applied_run_count = 0
+        self.event61_adc_ranges = set()
+        self.event61_channel_indices = set()
+
+        # Run-level veto summary data
+        self.run_veto_summaries = []
+
+    def _load_all_subjob_data(self):
+        """Loops over all sub-job directories and populates the master containers."""
+        for sub_dir in self.subjob_dirs:
+            print(f"Processing {sub_dir.name}...")
+            
+            self._load_main_arrays(sub_dir)
+            self._load_event61_data(sub_dir)
+            self._load_sipm_data(sub_dir)
+            self._load_sipm_noise_ratio_data(sub_dir)
+            self._load_veto_data(sub_dir)
+            self._load_run_level_veto_data(sub_dir)
+            self._load_low_light_data(sub_dir)
+            self._load_highlight_data(sub_dir)
+            self._load_thin_veto_data(sub_dir)
+            self._load_brn_data(sub_dir)
+            self._load_time_length_data(sub_dir)
+
+    def _load_main_arrays(self, sub_dir):
+        """Load main histogram payloads, falling back to old raw arrays if needed."""
+        dt_hist_file = sub_dir / 'aggregated_delta_t_hist.pkl'
+        pe_hist_file = sub_dir / 'aggregated_total_pe_hist.pkl'
+
+        if dt_hist_file.exists():
+            try:
+                with open(dt_hist_file, 'rb') as f:
+                    dt_payload = pickle.load(f)
+                dt_edges = np.asarray(dt_payload.get('edges', []), dtype=float)
+                dt_counts = np.asarray(dt_payload.get('counts', []), dtype=float)
+                if dt_edges.shape == self.main_dt_bin_edges.shape and np.allclose(dt_edges, self.main_dt_bin_edges):
+                    self.master_dt_counts += dt_counts
+                    self.main_data_found = True
+                else:
+                    print(f"  Warning: Delta-t histogram edge mismatch in {sub_dir.name}; skipping histogram payload.")
+            except Exception as e:
+                print(f"  Warning: Could not load Delta-t histogram payload for {sub_dir.name}. Error: {e}")
+        elif (sub_dir / 'aggregated_delta_t.npy').exists():
+            raw_dt = self.data_aggregator.incremental_concatenate(None, sub_dir / 'aggregated_delta_t.npy')
+            if raw_dt is not None and raw_dt.size > 0:
+                self.master_dt_counts += np.histogram(raw_dt, bins=self.main_dt_bin_edges)[0]
+                self.main_data_found = True
+
+        if pe_hist_file.exists():
+            try:
+                with open(pe_hist_file, 'rb') as f:
+                    pe_payload = pickle.load(f)
+                pe_edges = np.asarray(pe_payload.get('edges', []), dtype=float)
+                pe_counts = np.asarray(pe_payload.get('counts', []), dtype=float)
+                if pe_edges.shape == self.main_pe_bin_edges.shape and np.allclose(pe_edges, self.main_pe_bin_edges):
+                    self.master_pe_counts += pe_counts
+                    self.main_data_found = True
+                else:
+                    print(f"  Warning: Total-PE histogram edge mismatch in {sub_dir.name}; skipping histogram payload.")
+            except Exception as e:
+                print(f"  Warning: Could not load Total-PE histogram payload for {sub_dir.name}. Error: {e}")
+        elif (sub_dir / 'aggregated_total_pe.npy').exists():
+            raw_pe = self.data_aggregator.incremental_concatenate(None, sub_dir / 'aggregated_total_pe.npy')
+            if raw_pe is not None and raw_pe.size > 0:
+                self.master_pe_counts += np.histogram(raw_pe, bins=self.main_pe_bin_edges)[0]
+                self.main_data_found = True
+
+    def _load_event61_data(self, sub_dir):
+        """Load Event61 histogram payloads from subjobs."""
+        event61_hist_file = sub_dir / 'aggregated_event61_hist.pkl'
+        if not event61_hist_file.exists():
+            return
+
+        try:
+            with open(event61_hist_file, 'rb') as f:
+                event61_payload = pickle.load(f)
+            event61_edges = np.asarray(event61_payload.get('edges', []), dtype=float)
+            event61_counts = np.asarray(event61_payload.get('counts', []), dtype=float)
+            if event61_edges.shape != self.event61_bin_edges.shape or not np.allclose(event61_edges, self.event61_bin_edges):
+                print(f"  Warning: Event61 histogram edge mismatch in {sub_dir.name}; skipping histogram payload.")
+                return
+
+            self.master_event61_hist_counts += event61_counts
+            if np.any(event61_counts):
+                self.event61_data_found = True
+        except Exception as e:
+            print(f"  Warning: Could not load Event61 histogram payload for {sub_dir.name}. Error: {e}")
+
+    def _load_sipm_data(self, sub_dir):
+        """Load SiPM histogram payloads, falling back to old raw area arrays if needed."""
+        sipm_hist_file = sub_dir / 'aggregated_sipm_area_hists.pkl'
+        if sipm_hist_file.exists():
+            self.sipm_data_found = True
+            try:
+                with open(sipm_hist_file, 'rb') as f:
+                    sipm_payload = pickle.load(f)
+                sipm_edges = np.asarray(sipm_payload.get('edges', []), dtype=float)
+                if sipm_edges.shape != self.sipm_bin_edges.shape or not np.allclose(sipm_edges, self.sipm_bin_edges):
+                    print(f"  Warning: SiPM histogram edge mismatch in {sub_dir.name}; skipping histogram payload.")
+                    return
+
+                for ch, counts in sipm_payload.get('counts', {}).items():
+                    self.master_sipm_hist_counts[int(ch)] += np.asarray(counts, dtype=float)
+            except Exception as e:
+                print(f"  Warning: Could not process SiPM histogram payload for {sub_dir.name}. Error: {e}")
+        else:
+            sipm_file = sub_dir / 'aggregated_sipm_area_array.pkl'
+            if sipm_file.exists():
+                self.sipm_data_found = True
+                try:
+                    job_series = pd.read_pickle(sipm_file)
+                    job_area_data = np.array(job_series.to_list())
+                    if job_area_data.ndim == 1:
+                        print(f"  Skipping SiPM data for {sub_dir.name}, no valid area arrays found.")
+                        return
+
+                    for ch in self.sipm_channels:
+                        if ch < job_area_data.shape[1]:
+                            ch_data = job_area_data[:, ch]
+                            job_counts, _ = np.histogram(ch_data, bins=self.sipm_bin_edges)
+                            self.master_sipm_hist_counts[ch] += job_counts
+                except Exception as e:
+                    print(f"  Warning: Could not process SiPM data for {sub_dir.name}. Error: {e}")
+
+    def _load_sipm_noise_ratio_data(self, sub_dir):
+        """Load SiPM noise ratio (area/pulseH) histogram payloads."""
+        noise_file = sub_dir / 'aggregated_sipm_noise_ratio_hists.pkl'
+        if not noise_file.exists():
+            return
+        self.noise_ratio_data_found = True
+        try:
+            with open(noise_file, 'rb') as f:
+                noise_payload = pickle.load(f)
+            noise_edges = np.asarray(noise_payload.get('edges', []), dtype=float)
+            if noise_edges.shape != self.noise_ratio_bin_edges.shape or not np.allclose(noise_edges, self.noise_ratio_bin_edges):
+                print(f"  Warning: SiPM noise ratio histogram edge mismatch in {sub_dir.name}; skipping.")
+                return
+            for ch, counts in noise_payload.get('counts', {}).items():
+                self.master_noise_ratio_counts[int(ch)] += np.asarray(counts, dtype=float)
+        except Exception as e:
+            print(f"  Warning: Could not process SiPM noise ratio data for {sub_dir.name}. Error: {e}")
+
+    def _load_veto_data(self, sub_dir):
+        """Load veto histogram payloads, falling back to old raw PE series if needed."""
+        veto_hist_file = sub_dir / 'aggregated_veto_histograms.pkl'
+        if veto_hist_file.exists():
+            self.veto_data_found = True
+            try:
+                with open(veto_hist_file, 'rb') as f:
+                    veto_payload = pickle.load(f)
+                comp_edges = np.asarray(veto_payload.get('comparison_edges', []), dtype=float)
+                eff_edges = np.asarray(veto_payload.get('efficiency_edges', []), dtype=float)
+                if comp_edges.shape != self.pe_comp_bin_edges.shape or not np.allclose(comp_edges, self.pe_comp_bin_edges):
+                    print(f"  Warning: Veto comparison edge mismatch in {sub_dir.name}; skipping histogram payload.")
+                    return
+                if eff_edges.shape != self.veto_bin_edges.shape or not np.allclose(eff_edges, self.veto_bin_edges):
+                    print(f"  Warning: Veto efficiency edge mismatch in {sub_dir.name}; skipping histogram payload.")
+                    return
+
+                self.master_pe_comp_counts_2 += np.asarray(veto_payload.get('comparison_counts_2', 0), dtype=float)
+                self.master_pe_comp_counts_2_or_34 += np.asarray(veto_payload.get('comparison_counts_2_or_34', 0), dtype=float)
+                self.master_veto_counts_2 += np.asarray(veto_payload.get('efficiency_counts_2', 0), dtype=float)
+                self.master_veto_counts_2_or_34 += np.asarray(veto_payload.get('efficiency_counts_2_or_34', 0), dtype=float)
+            except Exception as e:
+                print(f"  Warning: Could not process veto histogram payload for {sub_dir.name}. Error: {e}")
+        else:
+            trig2_file = sub_dir / 'aggregated_pe_trig2.pkl'
+            if trig2_file.exists():
+                self.veto_data_found = True
+                job_series_2 = pd.read_pickle(trig2_file)
+                job_data_2 = job_series_2.to_numpy()
+
+                job_counts_comp_2, _ = np.histogram(job_data_2, bins=self.pe_comp_bin_edges)
+                job_counts_veto_2, _ = np.histogram(job_data_2, bins=self.veto_bin_edges)
+
+                self.master_pe_comp_counts_2 += job_counts_comp_2
+                self.master_veto_counts_2 += job_counts_veto_2
+
+            trig2_34_file = sub_dir / 'aggregated_pe_trig2_or_34.pkl'
+            if trig2_34_file.exists():
+                self.veto_data_found = True
+                job_series_2_34 = pd.read_pickle(trig2_34_file)
+                job_data_2_34 = job_series_2_34.to_numpy()
+
+                job_counts_comp_2_34, _ = np.histogram(job_data_2_34, bins=self.pe_comp_bin_edges)
+                job_counts_veto_2_34, _ = np.histogram(job_data_2_34, bins=self.veto_bin_edges)
+
+                self.master_pe_comp_counts_2_or_34 += job_counts_comp_2_34
+                self.master_veto_counts_2_or_34 += job_counts_veto_2_34
+
+    def _parse_run_start_datetime(self, run_dir_name, run_start_time_str):
+        """Parse run start datetime from summary string or run directory name."""
+        candidate_strings = []
+        if isinstance(run_start_time_str, str) and run_start_time_str != 'no_ts':
+            candidate_strings.append(run_start_time_str)
+
+        if '_' in run_dir_name:
+            suffix = run_dir_name.split('_', 1)[1]
+            if suffix and suffix != 'no_ts':
+                candidate_strings.append(suffix)
+
+        for candidate in candidate_strings:
+            try:
+                return datetime.strptime(candidate, '%Y%m%d-%H')
+            except ValueError:
+                continue
+        return None
+
+    def _load_beam_on_count_from_run_pickle(self, run_dir):
+        """Fallback beam-on count for older run summaries that do not store it."""
+        for data_file in sorted(run_dir.glob('*_data_with_pe.pkl')):
+            try:
+                run_df = pd.read_pickle(data_file)
+            except Exception as e:
+                print(f"  Warning: Could not read beam-on count from {data_file}. Error: {e}")
+                continue
+
+            if 'triggerBits' not in run_df.columns:
+                continue
+
+            return int(np.count_nonzero(run_df['triggerBits'].to_numpy() == 0))
+
+        return 0
+
+    def _load_run_level_veto_data(self, sub_dir):
+        """Load per-run average veto efficiency summaries from run folders."""
+        for run_dir in sorted(sub_dir.glob('run*')):
+            if not run_dir.is_dir():
+                continue
+
+            summary_file = run_dir / 'run_veto_summary.json'
+            if not summary_file.exists():
+                continue
+
+            try:
+                with open(summary_file, 'r') as f:
+                    info = json.load(f)
+
+                run_number = info.get('run')
+                avg_eff = info.get('average_efficiency', np.nan)
+                avg_err = info.get('average_efficiency_error', np.nan)
+                run_start_str = info.get('run_start_time', 'no_ts')
+                run_dt = self._parse_run_start_datetime(run_dir.name, run_start_str)
+
+                try:
+                    avg_eff_val = float(avg_eff)
+                except (TypeError, ValueError):
+                    avg_eff_val = np.nan
+                try:
+                    avg_err_val = float(avg_err)
+                except (TypeError, ValueError):
+                    avg_err_val = np.nan
+
+                beam_on_count = info.get('beam_on_count')
+                try:
+                    beam_on_count_val = int(beam_on_count)
+                except (TypeError, ValueError):
+                    beam_on_count_val = self._load_beam_on_count_from_run_pickle(run_dir)
+
+                brn_beam_on_count = info.get('brn_beam_on_count', beam_on_count_val)
+                try:
+                    brn_beam_on_count_val = int(brn_beam_on_count)
+                except (TypeError, ValueError):
+                    brn_beam_on_count_val = beam_on_count_val
+
+                event61_adjustment_applied = bool(info.get('event61_adjustment_applied', False))
+                event61_adc_range_raw = info.get('event61_adc_range')
+                event61_adc_min = np.nan
+                event61_adc_max = np.nan
+                if isinstance(event61_adc_range_raw, (list, tuple)) and len(event61_adc_range_raw) == 2:
+                    try:
+                        event61_adc_min = float(event61_adc_range_raw[0])
+                    except (TypeError, ValueError):
+                        event61_adc_min = np.nan
+                    try:
+                        event61_adc_max = float(event61_adc_range_raw[1]) if event61_adc_range_raw[1] is not None else np.nan
+                    except (TypeError, ValueError):
+                        event61_adc_max = np.nan
+                else:
+                    try:
+                        event61_adc_min = float(info.get('event61_threshold_adc', np.nan))
+                    except (TypeError, ValueError):
+                        event61_adc_min = np.nan
+                try:
+                    event61_channel_index = int(info.get('event61_channel_index', -1))
+                except (TypeError, ValueError):
+                    event61_channel_index = -1
+                try:
+                    event61_count = int(info.get('event61_count', 0))
+                except (TypeError, ValueError):
+                    event61_count = 0
+                event61_channel_available = bool(info.get('event61_channel_available', False))
+                mu1_values = np.asarray(info.get('mu1_values', [np.nan] * 12), dtype=float)
+                if mu1_values.size != 12:
+                    mu1_values = np.full(12, np.nan)
+
+                mu1_errors = np.asarray(info.get('mu1_errors', [np.nan] * 12), dtype=float)
+                if mu1_errors.size != 12:
+                    mu1_errors = np.full(12, np.nan)
+
+                hl_peak = np.asarray(info.get('highlight_peak_pe', [np.nan] * 12), dtype=float)
+                if hl_peak.size != 12:
+                    hl_peak = np.full(12, np.nan)
+
+                hl_peak_err = np.asarray(info.get('highlight_peak_pe_err', [np.nan] * 12), dtype=float)
+                if hl_peak_err.size != 12:
+                    hl_peak_err = np.full(12, np.nan)
+
+                try:
+                    hl_avg_val = float(info.get('highlight_avg_pe', np.nan))
+                except (TypeError, ValueError):
+                    hl_avg_val = np.nan
+
+                try:
+                    michel_peak_val = float(info.get('michel_peak_pe', np.nan))
+                except (TypeError, ValueError):
+                    michel_peak_val = np.nan
+                try:
+                    michel_peak_err_val = float(info.get('michel_peak_pe_err', np.nan))
+                except (TypeError, ValueError):
+                    michel_peak_err_val = np.nan
+                try:
+                    michel_sigma_val = float(info.get('michel_sigma_pe', np.nan))
+                except (TypeError, ValueError):
+                    michel_sigma_val = np.nan
+                try:
+                    michel_sigma_err_val = float(info.get('michel_sigma_pe_err', np.nan))
+                except (TypeError, ValueError):
+                    michel_sigma_err_val = np.nan
+
+                try:
+                    event61_hist_total_entries = int(info.get('event61_hist_total_entries', 0))
+                except (TypeError, ValueError):
+                    event61_hist_total_entries = 0
+                event61_fit_success = bool(info.get('event61_fit_success', False))
+                try:
+                    event61_fit_mean_adc = float(info.get('event61_fit_mean_adc', np.nan))
+                except (TypeError, ValueError):
+                    event61_fit_mean_adc = np.nan
+                try:
+                    event61_fit_mean_adc_err = float(info.get('event61_fit_mean_adc_err', np.nan))
+                except (TypeError, ValueError):
+                    event61_fit_mean_adc_err = np.nan
+                try:
+                    event61_fit_sigma_adc = float(info.get('event61_fit_sigma_adc', np.nan))
+                except (TypeError, ValueError):
+                    event61_fit_sigma_adc = np.nan
+                try:
+                    event61_fit_sigma_adc_err = float(info.get('event61_fit_sigma_adc_err', np.nan))
+                except (TypeError, ValueError):
+                    event61_fit_sigma_adc_err = np.nan
+                try:
+                    event61_fit_constant = float(info.get('event61_fit_constant', np.nan))
+                except (TypeError, ValueError):
+                    event61_fit_constant = np.nan
+                try:
+                    event61_fit_constant_err = float(info.get('event61_fit_constant_err', np.nan))
+                except (TypeError, ValueError):
+                    event61_fit_constant_err = np.nan
+                try:
+                    event61_fit_reduced_chi2 = float(info.get('event61_fit_reduced_chi2', np.nan))
+                except (TypeError, ValueError):
+                    event61_fit_reduced_chi2 = np.nan
+                try:
+                    event61_raw_window_count = float(info.get('event61_raw_window_count', np.nan))
+                except (TypeError, ValueError):
+                    event61_raw_window_count = np.nan
+                try:
+                    event61_background_window_count = float(
+                        info.get('event61_background_window_count', info.get('event61_pedestal_window_count', np.nan))
+                    )
+                except (TypeError, ValueError):
+                    event61_background_window_count = np.nan
+                try:
+                    event61_background_window_count_err = float(
+                        info.get('event61_background_window_count_err', info.get('event61_pedestal_window_count_err', np.nan))
+                    )
+                except (TypeError, ValueError):
+                    event61_background_window_count_err = np.nan
+                try:
+                    event61_background_subtracted_count = float(
+                        info.get('event61_background_subtracted_count', info.get('event61_pedestal_subtracted_count', np.nan))
+                    )
+                except (TypeError, ValueError):
+                    event61_background_subtracted_count = np.nan
+                try:
+                    event61_background_subtracted_count_err = float(
+                        info.get('event61_background_subtracted_count_err', info.get('event61_pedestal_subtracted_count_err', np.nan))
+                    )
+                except (TypeError, ValueError):
+                    event61_background_subtracted_count_err = np.nan
+
+                if run_number is None:
+                    continue
+
+                self.run_veto_summaries.append({
+                    'run': int(run_number),
+                    'run_dir': run_dir.name,
+                    'run_start_time': run_start_str,
+                    'run_datetime': run_dt,
+                    'beam_on_count': beam_on_count_val,
+                    'brn_beam_on_count': brn_beam_on_count_val,
+                    'average_efficiency': avg_eff_val if np.isfinite(avg_eff_val) else np.nan,
+                    'average_efficiency_error': avg_err_val if np.isfinite(avg_err_val) else np.nan,
+                    'valid_bin_count': int(info.get('valid_bin_count', 0)),
+                    'total_trig2': int(info.get('total_trig2', 0)),
+                    'total_trig2_or_34': int(info.get('total_trig2_or_34', 0)),
+                    'mu1_values': mu1_values,
+                    'mu1_errors': mu1_errors,
+                    'highlight_peak_pe': hl_peak,
+                    'highlight_peak_pe_err': hl_peak_err,
+                    'highlight_avg_pe': hl_avg_val if np.isfinite(hl_avg_val) else np.nan,
+                    'michel_peak_pe': michel_peak_val if np.isfinite(michel_peak_val) else np.nan,
+                    'michel_peak_pe_err': michel_peak_err_val if np.isfinite(michel_peak_err_val) else np.nan,
+                    'michel_sigma_pe': michel_sigma_val if np.isfinite(michel_sigma_val) else np.nan,
+                    'michel_sigma_pe_err': michel_sigma_err_val if np.isfinite(michel_sigma_err_val) else np.nan,
+                    'event61_adjustment_applied': event61_adjustment_applied,
+                    'event61_adc_min': event61_adc_min if np.isfinite(event61_adc_min) else np.nan,
+                    'event61_adc_max': event61_adc_max if np.isfinite(event61_adc_max) else np.nan,
+                    'event61_threshold_adc': event61_adc_min if np.isfinite(event61_adc_min) else np.nan,
+                    'event61_channel_index': event61_channel_index if event61_channel_index >= 0 else np.nan,
+                    'event61_count': event61_count,
+                    'event61_channel_available': event61_channel_available,
+                    'event61_hist_total_entries': event61_hist_total_entries,
+                    'event61_fit_success': event61_fit_success,
+                    'event61_fit_mean_adc': event61_fit_mean_adc if np.isfinite(event61_fit_mean_adc) else np.nan,
+                    'event61_fit_mean_adc_err': event61_fit_mean_adc_err if np.isfinite(event61_fit_mean_adc_err) else np.nan,
+                    'event61_fit_sigma_adc': event61_fit_sigma_adc if np.isfinite(event61_fit_sigma_adc) else np.nan,
+                    'event61_fit_sigma_adc_err': event61_fit_sigma_adc_err if np.isfinite(event61_fit_sigma_adc_err) else np.nan,
+                    'event61_fit_constant': event61_fit_constant if np.isfinite(event61_fit_constant) else np.nan,
+                    'event61_fit_constant_err': event61_fit_constant_err if np.isfinite(event61_fit_constant_err) else np.nan,
+                    'event61_fit_reduced_chi2': event61_fit_reduced_chi2 if np.isfinite(event61_fit_reduced_chi2) else np.nan,
+                    'event61_raw_window_count': event61_raw_window_count if np.isfinite(event61_raw_window_count) else np.nan,
+                    'event61_background_window_count': event61_background_window_count if np.isfinite(event61_background_window_count) else np.nan,
+                    'event61_background_window_count_err': event61_background_window_count_err if np.isfinite(event61_background_window_count_err) else np.nan,
+                    'event61_background_subtracted_count': event61_background_subtracted_count if np.isfinite(event61_background_subtracted_count) else np.nan,
+                    'event61_background_subtracted_count_err': event61_background_subtracted_count_err if np.isfinite(event61_background_subtracted_count_err) else np.nan,
+                })
+                self.total_beam_on_count += beam_on_count_val
+                self.total_brn_beam_on_count += brn_beam_on_count_val
+                if event61_adjustment_applied:
+                    self.event61_applied_run_count += 1
+                if np.isfinite(event61_adc_min):
+                    range_key = (
+                        float(event61_adc_min),
+                        float(event61_adc_max) if np.isfinite(event61_adc_max) else None,
+                    )
+                    self.event61_adc_ranges.add(range_key)
+                if event61_channel_index >= 0:
+                    self.event61_channel_indices.add(int(event61_channel_index))
+            except Exception as e:
+                print(f"  Warning: Could not read run-level veto summary from {summary_file}. Error: {e}")
+
+    def _load_low_light_data(self, sub_dir):
+        """Load and sum low-light histogram data."""
+        ll_file = sub_dir / 'aggregated_low_light_hists.pkl'
+        if ll_file.exists():
+            self.ll_data_found = True
+            try:
+                with open(ll_file, 'rb') as f:
+                    ll_data = pickle.load(f)
+                job_ll_counts = ll_data['counts']
+                
+                if self.master_ll_hist_counts is None:
+                    self.master_ll_hist_counts = job_ll_counts.copy()
+                    self.ll_bin_edges = ll_data['edges']
+                else:
+                    for ch in self.master_ll_hist_counts.keys():
+                        self.master_ll_hist_counts[ch] += job_ll_counts.get(ch, 0)
+                        
+            except Exception as e:
+                print(f"  Warning: Could not process Low-Light data for {sub_dir.name}. Error: {e}")
+
+    def _load_highlight_data(self, sub_dir):
+        """Load and sum highlight histogram data."""
+        hl_file = sub_dir / 'aggregated_highlight_hists.pkl'
+        if hl_file.exists():
+            self.hl_data_found = True
+            try:
+                with open(hl_file, 'rb') as f:
+                    hl_data = pickle.load(f)
+                job_hl_counts = hl_data['counts']
+
+                if self.master_hl_hist_counts is None:
+                    self.master_hl_hist_counts = {ch: np.asarray(job_hl_counts.get(ch, 0), dtype=float).copy() for ch in range(12)}
+                    self.hl_bin_edges = np.asarray(hl_data['edges'], dtype=float)
+                else:
+                    for ch in range(12):
+                        self.master_hl_hist_counts[ch] += np.asarray(job_hl_counts.get(ch, 0), dtype=float)
+            except Exception as e:
+                print(f"  Warning: Could not process Highlight data for {sub_dir.name}. Error: {e}")
+
+        hl_sum_file = sub_dir / 'aggregated_highlight_sum12_hists.pkl'
+        if hl_sum_file.exists():
+            self.hl_data_found = True
+            try:
+                with open(hl_sum_file, 'rb') as f:
+                    hl_sum_data = pickle.load(f)
+                job_hl_sum_counts = np.asarray(hl_sum_data.get('counts', []), dtype=float)
+                job_hl_sum_edges = np.asarray(hl_sum_data.get('edges', []), dtype=float)
+
+                if self.master_hl_sum_counts is None:
+                    self.master_hl_sum_counts = job_hl_sum_counts.copy()
+                    self.hl_sum_bin_edges = job_hl_sum_edges.copy()
+                else:
+                    if self.master_hl_sum_counts.shape == job_hl_sum_counts.shape:
+                        self.master_hl_sum_counts += job_hl_sum_counts
+                    else:
+                        print(f"  Warning: Sum12 highlight count shape mismatch in {sub_dir.name}; skipping.")
+            except Exception as e:
+                print(f"  Warning: Could not process Highlight sum12 data for {sub_dir.name}. Error: {e}")
+
+    def _load_thin_veto_data(self, sub_dir):
+        """Load and sum thin veto histogram data."""
+        tv_file = sub_dir / 'aggregated_thin_veto_hists.pkl'
+        if tv_file.exists():
+            self.tv_data_found = True
+            try:
+                with open(tv_file, 'rb') as f:
+                    tv_data = pickle.load(f)
+                job_tv_counts = tv_data['counts']
+                job_tv_edges = tv_data['edges']
+
+                if self.master_tv_muon_h_counts is None:
+                    self.master_tv_muon_h_counts = job_tv_counts.get('muon_h', 0).copy()
+                    self.master_tv_muon_a_counts = job_tv_counts.get('muon_a', 0).copy()
+                    self.master_tv_no_co_h_counts = job_tv_counts.get('no_co_h', 0).copy()
+                    self.master_tv_no_co_a_counts = job_tv_counts.get('no_co_a', 0).copy()
+                    self.tv_height_bin_edges = job_tv_edges.get('muon_h', job_tv_edges.get('no_co_h'))
+                    self.tv_area_bin_edges = job_tv_edges.get('muon_a', job_tv_edges.get('no_co_a'))
+                else:
+                    self.master_tv_muon_h_counts += job_tv_counts.get('muon_h', 0)
+                    self.master_tv_muon_a_counts += job_tv_counts.get('muon_a', 0)
+                    self.master_tv_no_co_h_counts += job_tv_counts.get('no_co_h', 0)
+                    self.master_tv_no_co_a_counts += job_tv_counts.get('no_co_a', 0)
+
+            except Exception as e:
+                print(f"  Warning: Could not process Thin Veto data for {sub_dir.name}. Error: {e}")
+
+    def _load_brn_data(self, sub_dir):
+        """Load BRN histogram payloads, falling back to old raw BRN arrays if needed."""
+        brn_hist_file = sub_dir / 'aggregated_brn_channel_hists.pkl'
+        if brn_hist_file.exists():
+            try:
+                with open(brn_hist_file, 'rb') as f:
+                    brn_payload = pickle.load(f)
+                dt_edges = np.asarray(brn_payload.get('delta_t_edges', []), dtype=float)
+                dt_edges = self._normalize_brn_delta_t_edges(dt_edges, self.brn_delta_t_edges)
+                area_edges = np.asarray(brn_payload.get('area_edges', []), dtype=float)
+                if area_edges.shape != self.brn_area_edges.shape or not np.allclose(area_edges, self.brn_area_edges):
+                    print(f"  Warning: BRN area edge mismatch in {sub_dir.name}; skipping histogram payload.")
+                    return
+
+                loaded_any_counts = False
+                for ch, counts in brn_payload.get('counts', {}).items():
+                    ch = int(ch)
+                    if ch not in self.master_brn_hist_counts:
+                        self.master_brn_hist_counts[ch] = {
+                            'delta_t': np.zeros(len(self.brn_delta_t_edges) - 1, dtype=float),
+                            'area': np.zeros(len(self.brn_area_edges) - 1, dtype=float),
+                            'delta_t_area': np.zeros((len(self.brn_delta_t_edges) - 1, len(self.brn_area_edges) - 1), dtype=float),
+                        }
+                    rebinned_dt_counts = self._rebin_histogram_counts(
+                        counts.get('delta_t', 0),
+                        dt_edges,
+                        self.brn_delta_t_edges,
+                        f"BRN delta_t for {sub_dir.name} channel {ch}"
+                    )
+                    heatmap_counts = np.asarray(counts.get('delta_t_area', []), dtype=float)
+                    expected_heatmap_shape = (len(self.brn_delta_t_edges) - 1, len(self.brn_area_edges) - 1)
+                    if heatmap_counts.size == 0:
+                        heatmap_counts = np.zeros(expected_heatmap_shape, dtype=float)
+                    elif heatmap_counts.shape != expected_heatmap_shape:
+                        print(f"  Warning: BRN delta_t-area heatmap shape mismatch in {sub_dir.name} channel {ch}; skipping 2D payload.")
+                        heatmap_counts = np.zeros(expected_heatmap_shape, dtype=float)
+                    self.master_brn_hist_counts[ch]['delta_t'] += rebinned_dt_counts
+                    self.master_brn_hist_counts[ch]['area'] += np.asarray(counts.get('area', 0), dtype=float)
+                    self.master_brn_hist_counts[ch]['delta_t_area'] += heatmap_counts
+                    if np.any(rebinned_dt_counts) or np.any(np.asarray(counts.get('area', 0), dtype=float)) or np.any(heatmap_counts):
+                        loaded_any_counts = True
+                if loaded_any_counts:
+                    self.brn_data_found = True
+            except Exception as e:
+                print(f"Warning: Could not load BRN histogram payload from {sub_dir.name}. Error: {e}")
+        else:
+            brn_file = sub_dir / 'aggregated_brn_channel_data.pkl'
+            if brn_file.exists():
+                try:
+                    with open(brn_file, 'rb') as f:
+                        raw_brn_data = pickle.load(f)
+                    self.brn_data_found = True
+                    merged = self.data_aggregator.merge_channel_data_dicts(raw_brn_data)
+                    for ch, data in merged.items():
+                        if ch not in self.master_brn_hist_counts:
+                            self.master_brn_hist_counts[ch] = {
+                                'delta_t': np.zeros(len(self.brn_delta_t_edges) - 1, dtype=float),
+                                'area': np.zeros(len(self.brn_area_edges) - 1, dtype=float),
+                                'delta_t_area': np.zeros((len(self.brn_delta_t_edges) - 1, len(self.brn_area_edges) - 1), dtype=float),
+                            }
+                        dt_values = np.asarray(data.get('delta_t', []), dtype=float)
+                        area_values = np.asarray(data.get('area', []), dtype=float)
+                        self.master_brn_hist_counts[ch]['delta_t'] += np.histogram(dt_values, bins=self.brn_delta_t_edges)[0]
+                        self.master_brn_hist_counts[ch]['area'] += np.histogram(area_values, bins=self.brn_area_edges)[0]
+                        if dt_values.size > 0 and dt_values.size == area_values.size:
+                            self.master_brn_hist_counts[ch]['delta_t_area'] += np.histogram2d(
+                                dt_values,
+                                area_values,
+                                bins=[self.brn_delta_t_edges, self.brn_area_edges],
+                            )[0]
+                except Exception as e:
+                    print(f"Warning: Could not load BRN data from {sub_dir.name}. Error: {e}")
+
+    def _load_time_length_data(self, sub_dir):
+        """Load and sum time length data from sub-job directory."""
+        json_file = sub_dir / "subjob_time_length.json"
+        if json_file.exists():
+            try:
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                    self.total_timelength_ns += data.get("timelength_ns", 0.0)
+                    self.total_timelength_s += data.get("timelength_s", 0.0)
+                    self.total_timelength_min += data.get("timelength_min", 0.0)
+            except Exception as e:
+                print(f"  Warning: Could not read time length from {json_file}. Error: {e}")
+        else:
+            # Fallback to summing individual runs if subjob file doesn't exist
+            print(f"  Warning: {json_file} not found. Falling back to summing individual runs.")
+            for run_dir in sub_dir.glob("run*"):
+                if run_dir.is_dir():
+                    run_json_file = run_dir / "time_length.json"
+                    if run_json_file.exists():
+                        try:
+                            with open(run_json_file, 'r') as f:
+                                data = json.load(f)
+                                self.total_timelength_ns += data.get("timelength_ns", 0.0)
+                                self.total_timelength_s += data.get("timelength_s", 0.0)
+                                self.total_timelength_min += data.get("timelength_min", 0.0)
+                        except Exception as e:
+                            print(f"  Warning: Could not read time length from {run_json_file}. Error: {e}")
+
+    def _save_total_time_length(self):
+        """Save the total aggregated time length."""
+        data = {
+            "total_timelength_ns": self.total_timelength_ns,
+            "total_timelength_s": self.total_timelength_s,
+            "total_timelength_min": self.total_timelength_min,
+            "total_timelength_hours": self.total_timelength_min / 60.0,
+            "total_timelength_days": self.total_timelength_min / (60.0 * 24.0)
+        }
+        output_file = self.master_output_dir / "total_time_length.json"
+        with open(output_file, 'w') as f:
+            json.dump(data, f, indent=4)
+        print(f"Total time length saved to {output_file}")
+        print(f"Total time: {self.total_timelength_min:.2f} minutes ({self.total_timelength_min/60.0:.2f} hours)")
+        print(f"Total time: {self.total_timelength_min/(60.0*24.0):.2f} days")
+
+    def _generate_master_plots(self):
+        """Uses the populated master containers to generate all plots."""
+        self._generate_main_plots()
+        self._generate_event61_plots()
+        self._generate_veto_plots()
+        self._generate_veto_efficiency_evolution_plot()
+        self._generate_beam_on_evolution_plot()
+        self._generate_event61_evolution_plots()
+        self._generate_michel_peak_evolution_plot()
+        self._generate_mu1_evolution_plot()
+        self._generate_low_light_plots()
+        self._generate_highlight_plots()
+        self._generate_highlight_evolution_plot()
+        self._generate_sipm_plots()
+        self._generate_sipm_noise_ratio_plots()
+        self._generate_thin_veto_plots()
+        self._generate_brn_plots()
+
+    def _prepare_evolution_x(self, run_df):
+        """Prepare x-axis values for evolution plots with date-first fallback to run number."""
+        run_df_dt = run_df.dropna(subset=['run_datetime']).copy()
+        if not run_df_dt.empty:
+            dropped = len(run_df) - len(run_df_dt)
+            if dropped > 0:
+                print(f"Warning: {dropped} runs have missing start time and are excluded from time-based evolution plots.")
+            run_df = run_df_dt.sort_values('run_datetime')
+            x = run_df['run_datetime'].to_list()
+            x_label = 'Run Start Time'
+            use_dates = True
+        else:
+            run_df = run_df.sort_values('run')
+            x = run_df['run'].to_numpy()
+            x_label = 'Run Number (start time unavailable)'
+            use_dates = False
+        return run_df, x, x_label, use_dates
+
+    def _format_evolution_xaxis(self, ax, run_df, use_dates):
+        """Apply adaptive x ticks with at most 6 major ticks."""
+        if use_dates:
+            locator = mdates.AutoDateLocator(maxticks=6)
+            formatter = mdates.DateFormatter('%Y-%m-%d\n%H:00')
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(formatter)
+            plt.gcf().autofmt_xdate(rotation=0, ha='center')
+        else:
+            max_ticks = min(6, len(run_df))
+            if max_ticks > 0:
+                idx = np.unique(np.linspace(0, len(run_df) - 1, max_ticks, dtype=int))
+                tick_x = run_df['run'].to_numpy()[idx]
+                ax.set_xticks(tick_x)
+
+    def _generate_main_plots(self):
+        """Generate delta_t, total_pe, and correlation plots."""
+        if self.main_data_found and (self.master_dt_counts.sum() > 0 or self.master_pe_counts.sum() > 0):
+            print("Aggregating delta_t, total_pe, and fitting for tau...")
+
+            dt_plot_cfg = get_master_plot_config('main_delta_t', {
+                'range': config.DELTA_T_CUT,
+                'bin_width_ns': config.DELTA_T_BIN_WIDTH_NS,
+                'fit_window': config.TAU_FIT_WINDOW,
+                'logscale': config.LOGSCALE_DT_AGG,
+                'do_tau_fit': config.DO_TAU_FIT,
+                'figure_size': (10, 6),
+                'dpi': 300,
+            })
+            pe_plot_cfg = get_master_plot_config('main_total_pe', {
+                'range': config.PE_CUT,
+                'bins': config.BINS,
+                'fit_range': (config.VETO_RANGE[0] * 0.5, config.VETO_RANGE[1] * 0.5),
+                'logscale': config.LOGSCALE_PE_AGG,
+                'figure_size': (10, 6),
+                'dpi': 300,
+            })
+            
+            master_aggregated_data = {
+                'delta_t_hist': self.master_dt_counts,
+                'delta_t_edges': self.main_dt_bin_edges,
+                'total_pe_hist': self.master_pe_counts,
+                'total_pe_edges': self.main_pe_bin_edges,
+            }
+            aggregate_plots(
+                master_aggregated_data,
+                self.master_output_dir,
+                self.m1_or_m2,
+                self.agg_label,
+                dt_plot_cfg,
+                pe_plot_cfg,
+            )
+
+    def _generate_event61_plots(self):
+        """Generate the master Event61 histogram and fit plot."""
+        if not self.event61_data_found and np.sum(self.master_event61_hist_counts) <= 0:
+            print("No Event61 histogram data found to plot.")
+            return
+
+        print("Aggregating Event61 pulseH histogram data...")
+        plot_cfg = get_master_plot_config('event61_hist', get_event61_fit_config())
+        hist_payload = {
+            'counts': self.master_event61_hist_counts,
+            'edges': self.event61_bin_edges,
+            'channel_index': int(getattr(config, 'EVENT61_CHANNEL_INDEX', 22)),
+            'channel_available': True,
+            'n_entries': int(np.sum(self.master_event61_hist_counts)),
+        }
+        plot_event61_histogram_payload(
+            hist_payload,
+            self.master_output_dir,
+            self.agg_label,
+            self.m1_or_m2,
+            fit_config=plot_cfg,
+            filename_suffix='event61_pulseh_fit_master',
+            title_prefix='Event61 pulseH Master',
+        )
+
+    def _generate_event61_evolution_plot(self, value_key, error_key, ylabel, title_suffix,
+                                         filename_suffix, plot_section, color, ecolor,
+                                         scale_factor=1.0):
+        """Generate one Event61 evolution plot from run-level fit summaries."""
+        if not self.run_veto_summaries:
+            print(f"No per-run summary data found for {title_suffix.lower()} evolution plot.")
+            return
+
+        run_df = pd.DataFrame(self.run_veto_summaries)
+        if value_key not in run_df.columns:
+            print(f"No {value_key} values found in run summaries.")
+            return
+
+        run_df[value_key] = pd.to_numeric(run_df[value_key], errors='coerce')
+        run_df = run_df.dropna(subset=[value_key])
+        if run_df.empty:
+            print(f"Run summaries present, but no valid {value_key} values were found.")
+            return
+
+        run_df, x, x_label, use_dates = self._prepare_evolution_x(run_df)
+        plot_cfg = get_master_plot_config(plot_section, {
+            'figure_size': (12, 6),
+            'dpi': 300,
+        })
+        y = run_df[value_key].to_numpy(dtype=float)
+        if error_key and error_key in run_df.columns:
+            yerr_raw = pd.to_numeric(run_df[error_key], errors='coerce').to_numpy(dtype=float)
+        else:
+            yerr_raw = np.full_like(y, np.nan)
+        scale_factor = float(scale_factor) if np.isfinite(scale_factor) and scale_factor != 0.0 else 1.0
+        y = y / scale_factor
+        yerr_raw = yerr_raw / scale_factor
+        yerr_plot = np.where(np.isfinite(yerr_raw), yerr_raw, 0.0)
+
+        plt.figure(figsize=tuple(plot_cfg.get('figure_size', (12, 6))))
+        plt.errorbar(
+            x,
+            y,
+            yerr=yerr_plot,
+            fmt='o-',
+            markersize=4,
+            linewidth=1,
+            capsize=2,
+            color=color,
+            ecolor=ecolor,
+            label=title_suffix,
+        )
+        plt.ylabel(ylabel)
+        plt.xlabel(x_label)
+        plt.title(f'{title_suffix} Evolution by Run ({self.agg_label}, {self.m1_or_m2})')
+        plt.grid(True, which='major', linestyle='-', linewidth=0.7)
+        plt.grid(True, which='minor', linestyle=':', linewidth=0.5)
+        plt.minorticks_on()
+        ax = plt.gca()
+        self._format_evolution_xaxis(ax, run_df, use_dates)
+        plt.legend()
+        plt.tight_layout()
+
+        img_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_{filename_suffix}.png'
+        pkl_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_{filename_suffix}.pkl'
+        csv_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_{filename_suffix}.csv'
+        plt.savefig(img_path, dpi=int(plot_cfg.get('dpi', 300)))
+        plt.close()
+
+        out_df = run_df[['run', 'run_dir', 'run_start_time']].copy()
+        out_df[value_key] = y
+        out_df[error_key] = yerr_raw
+        out_df['event61_fit_success'] = run_df['event61_fit_success'].astype(bool) if 'event61_fit_success' in run_df.columns else False
+        if 'event61_hist_total_entries' in run_df.columns:
+            out_df['event61_hist_total_entries'] = pd.to_numeric(run_df['event61_hist_total_entries'], errors='coerce').to_numpy(dtype=float)
+        else:
+            out_df['event61_hist_total_entries'] = np.zeros(len(run_df), dtype=float)
+        if use_dates:
+            out_df['run_datetime'] = pd.to_datetime(run_df['run_datetime']).dt.strftime('%Y-%m-%d %H:00')
+        else:
+            out_df['run_datetime'] = pd.NA
+
+        with open(pkl_path, 'wb') as f:
+            pickle.dump({'plot_data': out_df.to_dict(orient='list')}, f)
+        out_df.to_csv(csv_path, index=False)
+        print(f"{title_suffix} evolution plot saved to {img_path}")
+
+    def _generate_event61_evolution_plots(self):
+        """Generate run-by-run Event61 fit-result evolution plots."""
+        self._generate_event61_evolution_plot(
+            'event61_fit_mean_adc',
+            'event61_fit_mean_adc_err',
+            'Event61 Fit Mean (ADC)',
+            'Event61 Fit Mean',
+            'event61_mean_evolution',
+            'event61_mean_evolution',
+            'darkorange',
+            'sandybrown',
+        )
+        self._generate_event61_evolution_plot(
+            'event61_fit_sigma_adc',
+            'event61_fit_sigma_adc_err',
+            'Event61 Fit Sigma (ADC)',
+            'Event61 Fit Sigma',
+            'event61_sigma_evolution',
+            'event61_sigma_evolution',
+            'teal',
+            'lightseagreen',
+        )
+        self._generate_event61_evolution_plot(
+            'event61_background_subtracted_count',
+            'event61_background_subtracted_count_err',
+            r'$\bar{f}_{\mathrm{sub}}$ (Hz)',
+            'Event61 Signal Yield',
+            'event61_signal_evolution',
+            'event61_signal_evolution',
+            'purple',
+            'plum',
+            scale_factor=3600.0,
+        )
+
+    def _generate_veto_plots(self):
+        """Generate veto efficiency plots."""
+        if self.veto_data_found:
+            print("Aggregating veto efficiency data...")
+            comparison_cfg = get_master_plot_config('total_pe_comparison', {
+                'range': config.PE_CUT,
+                'logscale': True,
+                'figure_size': (10, 6),
+                'dpi': 300,
+            })
+            veto_cfg = get_master_plot_config('veto_efficiency', {
+                'range': config.VETO_RANGE,
+                'fit_range': (config.VETO_RANGE[0] * 0.5, config.VETO_RANGE[1] * 0.5),
+                'y_range': (0.995, 1.002),
+                'figure_size': (10, 6),
+                'dpi': 300,
+            })
+            
+            if self.master_pe_comp_counts_2.sum() > 0 or self.master_pe_comp_counts_2_or_34.sum() > 0:
+                self.binned_plotter.plot_histogram_from_binned_data(
+                    {'Trig=2 or 34': self.master_pe_comp_counts_2_or_34, 'Trig=2': self.master_pe_comp_counts_2},
+                    self.pe_comp_bin_edges,
+                    self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_total_pe_comparison_master.png",
+                    f'Total PE Comparison {self.agg_label}', 'Total P.E.', self.m1_or_m2,
+                    logscale=bool(comparison_cfg.get('logscale', True)),
+                    figsize=tuple(comparison_cfg.get('figure_size', (10, 6))),
+                    xlim=tuple(comparison_cfg.get('range', config.PE_CUT)),
+                    dpi=int(comparison_cfg.get('dpi', 300)),
+                )
+            else:
+                print("No events for Master Total PE comparison; skipping plot.")
+
+            veto_img_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_veto_efficiency_master.png"
+            veto_pkl_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_veto_efficiency_master.pkl"
+            self.binned_plotter.plot_veto_efficiency_from_binned_data(
+                self.master_veto_counts_2, self.master_veto_counts_2_or_34,
+                self.veto_bin_edges, tuple(veto_cfg.get('range', config.VETO_RANGE)),
+                veto_img_path, veto_pkl_path, f"Veto Efficiency {self.agg_label}", self.m1_or_m2,
+                fit_range=tuple(veto_cfg.get('fit_range', (config.VETO_RANGE[0] * 0.5, config.VETO_RANGE[1] * 0.5))),
+                y_range=tuple(veto_cfg.get('y_range', (0.995, 1.002))),
+                figsize=tuple(veto_cfg.get('figure_size', (10, 6))),
+                dpi=int(veto_cfg.get('dpi', 300)),
+            )
+        else:
+            print("No Veto Efficiency data found.")
+
+    def _generate_veto_efficiency_evolution_plot(self):
+        """Generate run-by-run average veto efficiency evolution plot vs real date/time."""
+        if not self.run_veto_summaries:
+            print("No per-run veto summary data found for evolution plot.")
+            return
+
+        run_df = pd.DataFrame(self.run_veto_summaries)
+        run_df = run_df.dropna(subset=['average_efficiency'])
+        if run_df.empty:
+            print("Run-level veto summaries are present, but no valid average efficiency values were found.")
+            return
+
+        run_df, x, x_label, use_dates = self._prepare_evolution_x(run_df)
+        plot_cfg = get_master_plot_config('veto_efficiency_evolution', {
+            'figure_size': (12, 6),
+            'dpi': 300,
+        })
+
+        y = run_df['average_efficiency'].to_numpy()
+        yerr = run_df['average_efficiency_error'].to_numpy()
+        finite_err = np.where(np.isfinite(yerr), yerr, 0.0)
+
+        plt.figure(figsize=tuple(plot_cfg.get('figure_size', (12, 6))))
+        plt.errorbar(
+            x, y, yerr=finite_err,
+            fmt='o-', markersize=4, linewidth=1,
+            capsize=2, color='navy', ecolor='steelblue',
+            label='Run average veto efficiency'
+        )
+        plt.ylabel('Average Veto Efficiency')
+        plt.xlabel(x_label)
+        plt.title(f'Veto Efficiency Evolution by Run ({self.agg_label}, {self.m1_or_m2})')
+        plt.grid(True, which='major', linestyle='-', linewidth=0.7)
+        plt.grid(True, which='minor', linestyle=':', linewidth=0.5)
+        plt.minorticks_on()
+
+        ax = plt.gca()
+        self._format_evolution_xaxis(ax, run_df, use_dates)
+
+        plt.legend()
+        plt.tight_layout()
+
+        img_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_veto_efficiency_evolution.png"
+        pkl_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_veto_efficiency_evolution.pkl"
+        csv_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_veto_efficiency_evolution.csv"
+
+        plt.savefig(img_path, dpi=int(plot_cfg.get('dpi', 300)))
+        plt.close()
+
+        out_df = run_df[['run', 'run_dir', 'run_start_time', 'average_efficiency', 'average_efficiency_error',
+                         'valid_bin_count', 'total_trig2', 'total_trig2_or_34']].copy()
+        if use_dates:
+            out_df['run_datetime'] = pd.to_datetime(run_df['run_datetime']).dt.strftime('%Y-%m-%d %H:00')
+        else:
+            out_df['run_datetime'] = pd.NA
+
+        with open(pkl_path, 'wb') as f:
+            pickle.dump({
+                'run_summaries': self.run_veto_summaries,
+                'plot_data': out_df.to_dict(orient='list')
+            }, f)
+        out_df.to_csv(csv_path, index=False)
+        print(f"Veto efficiency evolution plot saved to {img_path}")
+        print(f"Veto efficiency evolution data saved to {pkl_path}")
+
+    def _generate_beam_on_evolution_plot(self):
+        """Generate run-by-run beam-on count evolution from saved run summaries."""
+        if not self.run_veto_summaries:
+            print("No per-run summary data found for beam-on evolution plot.")
+            return
+
+        run_df = pd.DataFrame(self.run_veto_summaries)
+        count_column = 'brn_beam_on_count' if 'brn_beam_on_count' in run_df.columns else 'beam_on_count'
+        if count_column not in run_df.columns:
+            print("No beam-on counts found in run summaries.")
+            return
+
+        run_df[count_column] = pd.to_numeric(run_df[count_column], errors='coerce')
+        run_df = run_df.dropna(subset=[count_column])
+        if run_df.empty:
+            print("Run-level summaries are present, but no valid beam-on counts were found.")
+            return
+
+        run_df, x, x_label, use_dates = self._prepare_evolution_x(run_df)
+        plot_cfg = get_master_plot_config('beam_on_evolution', {
+            'figure_size': (12, 6),
+            'dpi': 300,
+        })
+
+        y = run_df[count_column].to_numpy(dtype=float)
+        mean_y = float(np.mean(y)) if y.size > 0 else np.nan
+        median_y = float(np.median(y)) if y.size > 0 else np.nan
+
+        plot_label = 'Beam-on count per run'
+        plot_title = f'Beam-on Count Evolution by Run ({self.agg_label}, {self.m1_or_m2})'
+        if count_column == 'brn_beam_on_count':
+            plot_label = 'Event61 beam-on count per run'
+            plot_title = f'Event61 Beam-on Count Evolution by Run ({self.agg_label}, {self.m1_or_m2})'
+
+        plt.figure(figsize=tuple(plot_cfg.get('figure_size', (12, 6))))
+        plt.plot(
+            x, y,
+            'o-', markersize=4, linewidth=1,
+            color='darkgreen', label=plot_label
+        )
+        if np.isfinite(mean_y):
+            plt.axhline(mean_y, color='darkred', linestyle='--', linewidth=1.2,
+                        label=f'Mean = {mean_y:.1f}')
+        if np.isfinite(median_y):
+            plt.axhline(median_y, color='goldenrod', linestyle=':', linewidth=1.4,
+                        label=f'Median = {median_y:.1f}')
+
+        plt.ylabel('Beam-on Count per Run')
+        plt.xlabel(x_label)
+        plt.title(plot_title)
+        plt.grid(True, which='major', linestyle='-', linewidth=0.7)
+        plt.grid(True, which='minor', linestyle=':', linewidth=0.5)
+        plt.minorticks_on()
+
+        ax = plt.gca()
+        self._format_evolution_xaxis(ax, run_df, use_dates)
+
+        plt.legend()
+        plt.tight_layout()
+
+        img_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_beam_on_evolution.png"
+        pkl_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_beam_on_evolution.pkl"
+        csv_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_beam_on_evolution.csv"
+
+        plt.savefig(img_path, dpi=int(plot_cfg.get('dpi', 300)))
+        plt.close()
+
+        out_df = run_df[['run', 'run_dir', 'run_start_time', count_column]].copy()
+        if use_dates:
+            out_df['run_datetime'] = pd.to_datetime(run_df['run_datetime']).dt.strftime('%Y-%m-%d %H:00')
+        else:
+            out_df['run_datetime'] = pd.NA
+
+        with open(pkl_path, 'wb') as f:
+            pickle.dump({
+                'run_summaries': self.run_veto_summaries,
+                'plot_data': out_df.to_dict(orient='list'),
+                'count_field': count_column,
+                'mean_beam_on_count': mean_y,
+                'median_beam_on_count': median_y,
+            }, f)
+        out_df.to_csv(csv_path, index=False)
+        print(f"Beam-on evolution plot saved to {img_path}")
+        print(f"Beam-on evolution data saved to {pkl_path}")
+
+    def _generate_michel_peak_evolution_plot(self):
+        """Generate run-by-run Michel peak evolution with configurable linear/exp fit."""
+        if not self.run_veto_summaries:
+            print("No per-run summary data found for Michel peak evolution plot.")
+            return
+
+        run_df = pd.DataFrame(self.run_veto_summaries)
+        if 'michel_peak_pe' not in run_df.columns:
+            print("No Michel peak values found in run summaries.")
+            return
+
+        run_df = run_df.dropna(subset=['michel_peak_pe'])
+        if run_df.empty:
+            print("Run summaries present, but no valid Michel peak values were found.")
+            return
+
+        run_df, x, x_label, use_dates = self._prepare_evolution_x(run_df)
+        plot_cfg = get_master_plot_config('michel_peak_evolution', {
+            'figure_size': (12, 6),
+            'dpi': 300,
+        })
+
+        y = run_df['michel_peak_pe'].to_numpy(dtype=float)
+        yerr_raw = run_df['michel_peak_pe_err'].to_numpy(dtype=float) if 'michel_peak_pe_err' in run_df.columns else np.full_like(y, np.nan)
+        sigma_vals = run_df['michel_sigma_pe'].to_numpy(dtype=float) if 'michel_sigma_pe' in run_df.columns else np.full_like(y, np.nan)
+        sigma_err_vals = run_df['michel_sigma_pe_err'].to_numpy(dtype=float) if 'michel_sigma_pe_err' in run_df.columns else np.full_like(y, np.nan)
+        yerr_plot = np.where(np.isfinite(yerr_raw), yerr_raw, 0.0)
+
+        plt.figure(figsize=tuple(plot_cfg.get('figure_size', (12, 6))))
+        plt.errorbar(
+            x, y, yerr=yerr_plot,
+            fmt='o-', markersize=4, linewidth=1,
+            capsize=2, color='darkred', ecolor='salmon',
+            label='Michel peak from FWHM Gaussian fit'
+        )
+
+        def linear_model(xv, a, b):
+            return a * xv + b
+
+        def exp_model(xv, a, t0, tau, b):
+            tau_safe = np.where(np.abs(tau) < 1e-12, 1e-12, tau)
+            expo = np.clip(-1 * (xv + t0) / tau_safe, -700, 700)
+            return a * np.exp(expo) + b
+
+        def compute_fit_quality(y_obs, y_pred, y_sigma, n_params):
+            valid_obs = np.isfinite(y_obs) & np.isfinite(y_pred)
+            n_obs = int(np.count_nonzero(valid_obs))
+            if n_obs <= n_params:
+                return np.nan, int(n_obs - n_params), np.nan
+
+            if y_sigma is not None:
+                sigma_mask = np.isfinite(y_sigma) & (y_sigma > 0)
+                sigma_mask = sigma_mask & valid_obs
+                n_sigma = int(np.count_nonzero(sigma_mask))
+                if n_sigma > n_params:
+                    resid = (y_obs[sigma_mask] - y_pred[sigma_mask]) / y_sigma[sigma_mask]
+                    chi2 = float(np.sum(resid ** 2))
+                    ndof = int(n_sigma - n_params)
+                    red = chi2 / ndof if ndof > 0 else np.nan
+                    return chi2, ndof, red
+
+            resid = y_obs[valid_obs] - y_pred[valid_obs]
+            chi2 = float(np.sum(resid ** 2))
+            ndof = int(n_obs - n_params)
+            red = chi2 / ndof if ndof > 0 else np.nan
+            return chi2, ndof, red
+
+        fit_cfg = getattr(config, 'MICHEL_EVOLUTION_FIT_CONFIG', {}) or {}
+        fit_model = str(fit_cfg.get('model', 'linear')).strip().lower()
+        if fit_model not in ('linear', 'exp'):
+            print(f"Warning: unsupported MICHEL_EVOLUTION_FIT_CONFIG['model']={fit_model}. Falling back to 'linear'.")
+            fit_model = 'linear'
+
+        fit_x_unit = 'day' if use_dates else 'run'
+        fit_x_origin = None
+        if use_dates:
+            run_dt = pd.to_datetime(run_df['run_datetime'])
+            x_fit_abs = mdates.date2num(run_dt.dt.to_pydatetime())
+            x_fit_origin = float(np.min(x_fit_abs))
+            x_fit_all = x_fit_abs - x_fit_origin
+            fit_x_origin = str(run_dt.min())
+        else:
+            x_fit_all = run_df['run'].to_numpy(dtype=float)
+
+        fit_mask = np.isfinite(x_fit_all) & np.isfinite(y)
+        fit_params = None
+        fit_param_err = None
+        if np.count_nonzero(fit_mask) >= 2:
+            x_fit = np.asarray(x_fit_all[fit_mask], dtype=float)
+            y_fit = np.asarray(y[fit_mask], dtype=float)
+            sigma_fit = np.asarray(yerr_raw[fit_mask], dtype=float)
+            valid_sigma = np.isfinite(sigma_fit) & (sigma_fit > 0)
+            try:
+                if fit_model == 'linear':
+                    n_params = 2
+                    if np.count_nonzero(valid_sigma) >= 2:
+                        x_in = x_fit[valid_sigma]
+                        y_in = y_fit[valid_sigma]
+                        sigma_in = sigma_fit[valid_sigma]
+                        popt, pcov = curve_fit(linear_model, x_in, y_in, sigma=sigma_in, absolute_sigma=True)
+                    else:
+                        x_in = x_fit
+                        y_in = y_fit
+                        sigma_in = None
+                        popt, pcov = curve_fit(linear_model, x_in, y_in)
+
+                    perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.array([np.nan, np.nan])
+                    fit_params = {
+                        'model': 'linear',
+                        'a': float(popt[0]),
+                        'b': float(popt[1]),
+                        'a_unit': f'P.E./{fit_x_unit}',
+                        'b_unit': 'P.E.'
+                    }
+                    fit_param_err = {'a_err': float(perr[0]), 'b_err': float(perr[1])}
+
+                    y_pred_fit = linear_model(x_in, *popt)
+                    chi2, ndof, red_chi2 = compute_fit_quality(y_in, y_pred_fit, sigma_in, n_params)
+                    fit_params.update({'chi2': chi2, 'ndof': ndof, 'reduced_chi2': red_chi2})
+
+                    x_line_num = np.linspace(np.min(x_fit), np.max(x_fit), 200)
+                    y_line = linear_model(x_line_num, *popt)
+                    x_line = mdates.num2date(x_line_num + x_fit_origin) if use_dates else x_line_num
+                    plt.plot(
+                        x_line, y_line,
+                        color='magenta', linewidth=2.0, linestyle='-',
+                        label=(
+                            f'Linear fit: a={popt[0]:.1f}±{perr[0]:.1f} P.E./{fit_x_unit}, '
+                            f'$\\chi^2$/DOF={red_chi2:.1f}'
+                        )
+                    )
+                else:
+                    n_params = 4
+                    x_span = float(np.max(x_fit) - np.min(x_fit)) if x_fit.size > 1 else 1.0
+                    x_span = max(x_span, 1e-6)
+                    y_min = float(np.min(y_fit))
+                    y_max = float(np.max(y_fit))
+                    a0 = float(y_max - y_min) if np.isfinite(y_max - y_min) and (y_max - y_min) != 0 else 1.0
+                    b0 = y_min
+                    t00 = float(fit_cfg.get('exp_initial_t0', 0.0))
+                    tau0 = float(fit_cfg.get('exp_initial_tau', max(1.0, x_span / 2.0)))
+                    tau_lo = float(fit_cfg.get('exp_tau_min', 1e-6))
+                    tau_hi = float(fit_cfg.get('exp_tau_max', max(10.0, 100.0 * x_span)))
+                    t0_lo = float(fit_cfg.get('exp_t0_min', -5.0 * x_span))
+                    t0_hi = float(fit_cfg.get('exp_t0_max', 5.0 * x_span))
+                    bounds = ([-np.inf, t0_lo, tau_lo, -np.inf], [np.inf, t0_hi, tau_hi, np.inf])
+                    p0 = [a0, t00, tau0, b0]
+
+                    if np.count_nonzero(valid_sigma) >= n_params:
+                        x_in = x_fit[valid_sigma]
+                        y_in = y_fit[valid_sigma]
+                        sigma_in = sigma_fit[valid_sigma]
+                        popt, pcov = curve_fit(
+                            exp_model, x_in, y_in,
+                            p0=p0, bounds=bounds,
+                            sigma=sigma_in, absolute_sigma=True,
+                            maxfev=100000
+                        )
+                    else:
+                        x_in = x_fit
+                        y_in = y_fit
+                        sigma_in = None
+                        popt, pcov = curve_fit(exp_model, x_in, y_in, p0=p0, bounds=bounds, maxfev=100000)
+
+                    perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.array([np.nan, np.nan, np.nan, np.nan])
+                    fit_params = {
+                        'model': 'exp',
+                        'a': float(popt[0]),
+                        't0': float(popt[1]),
+                        'tau': float(popt[2]),
+                        'b': float(popt[3]),
+                        'tau_unit': fit_x_unit,
+                        't0_unit': fit_x_unit,
+                        'a_unit': 'P.E.',
+                        'b_unit': 'P.E.'
+                    }
+                    fit_param_err = {
+                        'a_err': float(perr[0]),
+                        't0_err': float(perr[1]),
+                        'tau_err': float(perr[2]),
+                        'b_err': float(perr[3])
+                    }
+
+                    y_pred_fit = exp_model(x_in, *popt)
+                    chi2, ndof, red_chi2 = compute_fit_quality(y_in, y_pred_fit, sigma_in, n_params)
+                    fit_params.update({'chi2': chi2, 'ndof': ndof, 'reduced_chi2': red_chi2})
+
+                    x_line_num = np.linspace(np.min(x_fit), np.max(x_fit), 200)
+                    y_line = exp_model(x_line_num, *popt)
+                    x_line = mdates.num2date(x_line_num + x_fit_origin) if use_dates else x_line_num
+                    plt.plot(
+                        x_line, y_line,
+                        color='magenta', linewidth=2.0, linestyle='-',
+                        label=(
+                            f'Exp fit: $\\tau={popt[2]:.1f}\\pm{perr[2]:.1f}\\,{fit_x_unit}$, '
+                            f'$\\chi^2/\\mathrm{{DOF}}={red_chi2:.1f}$'
+                        )
+                    )
+            except Exception as e:
+                print(f"Warning: {fit_model} fit failed for Michel peak evolution. Error: {e}")
+
+        plt.ylabel('Michel Peak (P.E.)')
+        plt.xlabel(x_label)
+        plt.title(f'Michel Peak Evolution by Run ({self.agg_label}, {self.m1_or_m2})')
+        plt.grid(True, which='major', linestyle='-', linewidth=0.7)
+        plt.grid(True, which='minor', linestyle=':', linewidth=0.5)
+        plt.minorticks_on()
+        ax = plt.gca()
+        self._format_evolution_xaxis(ax, run_df, use_dates)
+        plt.legend()
+        plt.tight_layout()
+
+        img_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_peak_evolution.png"
+        pkl_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_peak_evolution.pkl"
+        csv_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_peak_evolution.csv"
+        plt.savefig(img_path, dpi=int(plot_cfg.get('dpi', 300)))
+        plt.close()
+
+        out_df = run_df[['run', 'run_dir', 'run_start_time']].copy()
+        out_df['michel_peak_pe'] = y
+        out_df['michel_peak_pe_err'] = yerr_raw
+        out_df['michel_sigma_pe'] = sigma_vals
+        out_df['michel_sigma_pe_err'] = sigma_err_vals
+        if use_dates:
+            out_df['run_datetime'] = pd.to_datetime(run_df['run_datetime']).dt.strftime('%Y-%m-%d %H:00')
+        else:
+            out_df['run_datetime'] = pd.NA
+
+        with open(pkl_path, 'wb') as f:
+            pickle.dump({
+                'plot_data': out_df.to_dict(orient='list'),
+                'fit_model': fit_model,
+                'fit_params': fit_params,
+                'fit_param_err': fit_param_err,
+                'fit_x_unit': fit_x_unit,
+                'fit_x_origin': fit_x_origin
+            }, f)
+        out_df.to_csv(csv_path, index=False)
+        print(f"Michel peak evolution plot saved to {img_path}")
+        print(f"Michel peak evolution data saved to {pkl_path}")
+
+    def _generate_mu1_evolution_plot(self):
+        """Generate mu1 evolution for all 12 PMT channels."""
+        if not self.run_veto_summaries:
+            print("No per-run summary data found for mu1 evolution plot.")
+            return
+
+        run_df = pd.DataFrame(self.run_veto_summaries)
+        if 'mu1_values' not in run_df.columns:
+            print("No mu1 values found in run summaries.")
+            return
+
+        run_df = run_df[run_df['mu1_values'].apply(lambda v: isinstance(v, (list, np.ndarray)) and len(v) == 12)]
+        if run_df.empty:
+            print("Run summaries present, but no valid mu1 arrays were found.")
+            return
+
+        run_df, x, x_label, use_dates = self._prepare_evolution_x(run_df)
+        plot_cfg = get_master_plot_config('mu1_evolution', {
+            'figure_size': (13, 7),
+            'legend_ncol': 3,
+            'dpi': 300,
+        })
+        err_matrix = np.vstack(run_df['mu1_errors'].apply(lambda arr: np.asarray(arr, dtype=float)).to_numpy()) if 'mu1_errors' in run_df.columns else np.full((len(run_df), 12), np.nan)
+
+        plt.figure(figsize=tuple(plot_cfg.get('figure_size', (13, 7))))
+        cmap = plt.cm.get_cmap('tab20', 12)
+        for ch in range(12):
+            y = run_df['mu1_values'].apply(lambda arr: float(np.asarray(arr, dtype=float)[ch])).to_numpy()
+            yerr = np.where(np.isfinite(err_matrix[:, ch]), err_matrix[:, ch], 0.0)
+            plt.errorbar(x, y, yerr=yerr, fmt='o-', markersize=3.5, linewidth=1.2, capsize=1.5,
+                         color=cmap(ch), alpha=0.9, label=f'PMT {ch}')
+
+        plt.ylabel('$\\mu_1$ Area (ADC)')
+        plt.xlabel(x_label)
+        plt.title(f'Low-Light $\\mu_1$ Evolution by Run ({self.agg_label}, {self.m1_or_m2})')
+        plt.grid(True, which='major', linestyle='-', linewidth=0.7)
+        plt.grid(True, which='minor', linestyle=':', linewidth=0.5)
+        plt.minorticks_on()
+        ax = plt.gca()
+        self._format_evolution_xaxis(ax, run_df, use_dates)
+        plt.legend(ncol=int(plot_cfg.get('legend_ncol', 3)), fontsize='small')
+        plt.tight_layout()
+
+        img_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_mu1_evolution.png"
+        pkl_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_mu1_evolution.pkl"
+        csv_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_mu1_evolution.csv"
+        plt.savefig(img_path, dpi=int(plot_cfg.get('dpi', 300)))
+        plt.close()
+
+        out_df = run_df[['run', 'run_dir', 'run_start_time']].copy()
+        mu1_matrix = np.vstack(run_df['mu1_values'].apply(lambda arr: np.asarray(arr, dtype=float)).to_numpy())
+        for ch in range(12):
+            out_df[f'mu1_ch{ch}'] = mu1_matrix[:, ch]
+            out_df[f'mu1_err_ch{ch}'] = err_matrix[:, ch]
+        if use_dates:
+            out_df['run_datetime'] = pd.to_datetime(run_df['run_datetime']).dt.strftime('%Y-%m-%d %H:00')
+        else:
+            out_df['run_datetime'] = pd.NA
+
+        with open(pkl_path, 'wb') as f:
+            pickle.dump({'plot_data': out_df.to_dict(orient='list')}, f)
+        out_df.to_csv(csv_path, index=False)
+        print(f"mu1 evolution plot saved to {img_path}")
+
+    def _generate_highlight_plots(self):
+        """Generate aggregated highlight PMT PE fit plots."""
+        if self.hl_data_found and self.master_hl_hist_counts is not None and self.hl_bin_edges is not None:
+            print("Plotting aggregated highlight PMT P.E. data...")
+            channel_cfg = get_master_plot_config('highlight_pe_channels', {
+                'hist_range': (float(self.hl_bin_edges[0]), float(self.hl_bin_edges[-1])),
+                'figure_size': (20, 15),
+                'dpi': 300,
+            })
+            sum_cfg = get_master_plot_config('highlight_pe_sum', {
+                'hist_range': (
+                    float(self.hl_sum_bin_edges[0]) if self.hl_sum_bin_edges is not None and len(self.hl_sum_bin_edges) >= 2 else float(self.hl_bin_edges[0]),
+                    float(self.hl_sum_bin_edges[-1]) if self.hl_sum_bin_edges is not None and len(self.hl_sum_bin_edges) >= 2 else float(self.hl_bin_edges[-1]) * 12.0,
+                ),
+                'figure_size': (10, 6),
+                'dpi': 300,
+            })
+            hist_range = tuple(channel_cfg.get('hist_range', (float(self.hl_bin_edges[0]), float(self.hl_bin_edges[-1]))))
+            sum_hist_range = tuple(sum_cfg.get(
+                'hist_range',
+                (float(self.hl_sum_bin_edges[0]), float(self.hl_sum_bin_edges[-1]))
+            )) if self.hl_sum_bin_edges is not None and len(self.hl_sum_bin_edges) >= 2 else (
+                float(hist_range[0]), float(hist_range[1]) * 12.0
+            )
+            self.binned_plotter.fit_and_plot_highlight_from_binned_data(
+                self.master_hl_hist_counts,
+                self.hl_bin_edges,
+                self.master_output_dir,
+                self.agg_label,
+                self.m1_or_m2,
+                hist_range=hist_range,
+                sum_hist_counts=self.master_hl_sum_counts,
+                sum_bin_edges=self.hl_sum_bin_edges,
+                sum_hist_range=sum_hist_range,
+                plot_config=channel_cfg,
+                sum_plot_config=sum_cfg,
+            )
+        else:
+            print("No Highlight data found to plot.")
+
+    def _generate_highlight_evolution_plot(self):
+        """Generate highlight peak evolution for 12 PMTs + average line."""
+        if not self.run_veto_summaries:
+            print("No per-run summary data found for highlight evolution plot.")
+            return
+
+        run_df = pd.DataFrame(self.run_veto_summaries)
+        if 'highlight_peak_pe' not in run_df.columns:
+            print("No highlight peak values found in run summaries.")
+            return
+
+        run_df = run_df[run_df['highlight_peak_pe'].apply(lambda v: isinstance(v, (list, np.ndarray)) and len(v) == 12)]
+        if run_df.empty:
+            print("Run summaries present, but no valid highlight peak arrays were found.")
+            return
+
+        run_df, x, x_label, use_dates = self._prepare_evolution_x(run_df)
+        plot_cfg = get_master_plot_config('highlight_peak_evolution', {
+            'figure_size': (13, 7),
+            'legend_ncol': 3,
+            'dpi': 300,
+        })
+        peak_matrix = np.vstack(run_df['highlight_peak_pe'].apply(lambda arr: np.asarray(arr, dtype=float)).to_numpy())
+        err_matrix = np.vstack(run_df['highlight_peak_pe_err'].apply(lambda arr: np.asarray(arr, dtype=float)).to_numpy()) if 'highlight_peak_pe_err' in run_df.columns else np.full_like(peak_matrix, np.nan)
+        avg_vals = run_df['highlight_avg_pe'].to_numpy(dtype=float) if 'highlight_avg_pe' in run_df.columns else np.nanmean(peak_matrix, axis=1)
+
+        # Propagate per-channel fit uncertainties to the 12-channel average.
+        finite_err_matrix = np.where(np.isfinite(err_matrix), err_matrix, np.nan)
+        n_valid_err = np.sum(np.isfinite(finite_err_matrix), axis=1)
+        avg_err = np.sqrt(np.nansum(finite_err_matrix ** 2, axis=1)) / np.where(n_valid_err > 0, n_valid_err, np.nan)
+
+        plt.figure(figsize=tuple(plot_cfg.get('figure_size', (13, 7))))
+        cmap = plt.cm.get_cmap('tab20', 12)
+        for ch in range(12):
+            y = peak_matrix[:, ch]
+            yerr = np.where(np.isfinite(err_matrix[:, ch]), err_matrix[:, ch], 0.0)
+            plt.errorbar(x, y, yerr=yerr, fmt='o-', markersize=3.0, linewidth=1.0, capsize=1.5,
+                         color=cmap(ch), alpha=0.9, label=f'PMT {ch}')
+
+        avg_yerr_plot = np.where(np.isfinite(avg_err), avg_err, 0.0)
+        plt.errorbar(
+            x, avg_vals, yerr=avg_yerr_plot,
+            fmt='s--', linewidth=2.0, markersize=4.0, capsize=2.0,
+            color='k', ecolor='k', alpha=0.95, label='Average (12 PMTs)'
+        )
+
+        # Fit on average series (configurable model).
+        def linear_model(xv, a, b):
+            return a * xv + b
+
+        def exp_model(xv, a, t0, tau, b):
+            tau_safe = np.where(np.abs(tau) < 1e-12, 1e-12, tau)
+            expo = np.clip(-1 * (xv + t0) / tau_safe, -700, 700)
+            return a * np.exp(expo) + b
+
+        def compute_fit_quality(y_obs, y_pred, y_sigma, n_params):
+            valid_obs = np.isfinite(y_obs) & np.isfinite(y_pred)
+            n_obs = int(np.count_nonzero(valid_obs))
+            if n_obs <= n_params:
+                return np.nan, int(n_obs - n_params), np.nan
+
+            if y_sigma is not None:
+                sigma_mask = np.isfinite(y_sigma) & (y_sigma > 0)
+                sigma_mask = sigma_mask & valid_obs
+                n_sigma = int(np.count_nonzero(sigma_mask))
+                if n_sigma > n_params:
+                    resid = (y_obs[sigma_mask] - y_pred[sigma_mask]) / y_sigma[sigma_mask]
+                    chi2 = float(np.sum(resid ** 2))
+                    ndof = int(n_sigma - n_params)
+                    red = chi2 / ndof if ndof > 0 else np.nan
+                    return chi2, ndof, red
+
+            resid = y_obs[valid_obs] - y_pred[valid_obs]
+            chi2 = float(np.sum(resid ** 2))
+            ndof = int(n_obs - n_params)
+            red = chi2 / ndof if ndof > 0 else np.nan
+            return chi2, ndof, red
+
+        fit_cfg = getattr(config, 'HIGHLIGHT_EVOLUTION_FIT_CONFIG', {}) or {}
+        fit_model = str(fit_cfg.get('model', 'linear')).strip().lower()
+        if fit_model not in ('linear', 'exp'):
+            print(f"Warning: unsupported HIGHLIGHT_EVOLUTION_FIT_CONFIG['model']={fit_model}. Falling back to 'linear'.")
+            fit_model = 'linear'
+
+        fit_x_unit = 'day' if use_dates else 'run'
+        fit_x_origin = None
+        if use_dates:
+            run_dt = pd.to_datetime(run_df['run_datetime'])
+            x_fit_abs = mdates.date2num(run_dt.dt.to_pydatetime())
+            x_fit_origin = float(np.min(x_fit_abs))
+            x_fit_all = x_fit_abs - x_fit_origin  # elapsed days
+            fit_x_origin = str(run_dt.min())
+        else:
+            x_fit_all = run_df['run'].to_numpy(dtype=float)
+
+        fit_mask = np.isfinite(x_fit_all) & np.isfinite(avg_vals)
+        fit_params = None
+        fit_param_err = None
+        if np.count_nonzero(fit_mask) >= 2:
+            x_fit = np.asarray(x_fit_all[fit_mask], dtype=float)
+            y_fit = np.asarray(avg_vals[fit_mask], dtype=float)
+            sigma_fit = np.asarray(avg_err[fit_mask], dtype=float)
+            valid_sigma = np.isfinite(sigma_fit) & (sigma_fit > 0)
+            try:
+                if fit_model == 'linear':
+                    n_params = 2
+                    if np.count_nonzero(valid_sigma) >= 2:
+                        x_in = x_fit[valid_sigma]
+                        y_in = y_fit[valid_sigma]
+                        sigma_in = sigma_fit[valid_sigma]
+                        popt, pcov = curve_fit(
+                            linear_model,
+                            x_in,
+                            y_in,
+                            sigma=sigma_in,
+                            absolute_sigma=True
+                        )
+                    else:
+                        x_in = x_fit
+                        y_in = y_fit
+                        sigma_in = None
+                        popt, pcov = curve_fit(linear_model, x_in, y_in)
+
+                    perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.array([np.nan, np.nan])
+                    fit_params = {
+                        'model': 'linear',
+                        'a': float(popt[0]),
+                        'b': float(popt[1]),
+                        'a_unit': f'P.E./{fit_x_unit}',
+                        'b_unit': 'P.E.'
+                    }
+                    fit_param_err = {'a_err': float(perr[0]), 'b_err': float(perr[1])}
+
+                    y_pred_fit = linear_model(x_in, *popt)
+                    chi2, ndof, red_chi2 = compute_fit_quality(y_in, y_pred_fit, sigma_in, n_params)
+                    fit_params.update({'chi2': chi2, 'ndof': ndof, 'reduced_chi2': red_chi2})
+
+                    x_line_num = np.linspace(np.min(x_fit), np.max(x_fit), 200)
+                    y_line = linear_model(x_line_num, *popt)
+                    if use_dates:
+                        x_line = mdates.num2date(x_line_num + x_fit_origin)
+                    else:
+                        x_line = x_line_num
+                    plt.plot(
+                        x_line,
+                        y_line,
+                        color='magenta',
+                        linewidth=2.0,
+                        linestyle='-',
+                        label=(
+                            f'Linear fit avg: a={popt[0]:.4e}±{perr[0]:.4e} P.E./{fit_x_unit}, '
+                            f'$\\chi^2$/DOF={red_chi2:.1f}'
+                        )
+                    )
+                else:
+                    n_params = 4
+                    x_span = float(np.max(x_fit) - np.min(x_fit)) if x_fit.size > 1 else 1.0
+                    x_span = max(x_span, 1e-6)
+                    y_min = float(np.min(y_fit))
+                    y_max = float(np.max(y_fit))
+                    a0 = float(y_max - y_min) if np.isfinite(y_max - y_min) and (y_max - y_min) != 0 else 1.0
+                    b0 = y_min
+                    t00 = float(fit_cfg.get('exp_initial_t0', 0.0))
+                    tau0 = float(fit_cfg.get('exp_initial_tau', max(1.0, x_span / 2.0)))
+                    tau_lo = float(fit_cfg.get('exp_tau_min', 1e-6))
+                    tau_hi = float(fit_cfg.get('exp_tau_max', max(10.0, 100.0 * x_span)))
+                    t0_lo = float(fit_cfg.get('exp_t0_min', -5.0 * x_span))
+                    t0_hi = float(fit_cfg.get('exp_t0_max', 5.0 * x_span))
+                    bounds = ([-np.inf, t0_lo, tau_lo, -np.inf], [np.inf, t0_hi, tau_hi, np.inf])
+                    p0 = [a0, t00, tau0, b0]
+
+                    if np.count_nonzero(valid_sigma) >= n_params:
+                        x_in = x_fit[valid_sigma]
+                        y_in = y_fit[valid_sigma]
+                        sigma_in = sigma_fit[valid_sigma]
+                        popt, pcov = curve_fit(
+                            exp_model,
+                            x_in,
+                            y_in,
+                            p0=p0,
+                            bounds=bounds,
+                            sigma=sigma_in,
+                            absolute_sigma=True,
+                            maxfev=100000
+                        )
+                    else:
+                        x_in = x_fit
+                        y_in = y_fit
+                        sigma_in = None
+                        popt, pcov = curve_fit(
+                            exp_model,
+                            x_in,
+                            y_in,
+                            p0=p0,
+                            bounds=bounds,
+                            maxfev=100000
+                        )
+
+                    perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.array([np.nan, np.nan, np.nan, np.nan])
+                    fit_params = {
+                        'model': 'exp',
+                        'a': float(popt[0]),
+                        't0': float(popt[1]),
+                        'tau': float(popt[2]),
+                        'b': float(popt[3]),
+                        'tau_unit': fit_x_unit,
+                        't0_unit': fit_x_unit,
+                        'a_unit': 'P.E.',
+                        'b_unit': 'P.E.'
+                    }
+                    fit_param_err = {
+                        'a_err': float(perr[0]),
+                        't0_err': float(perr[1]),
+                        'tau_err': float(perr[2]),
+                        'b_err': float(perr[3])
+                    }
+
+                    y_pred_fit = exp_model(x_in, *popt)
+                    chi2, ndof, red_chi2 = compute_fit_quality(y_in, y_pred_fit, sigma_in, n_params)
+                    fit_params.update({'chi2': chi2, 'ndof': ndof, 'reduced_chi2': red_chi2})
+
+                    x_line_num = np.linspace(np.min(x_fit), np.max(x_fit), 200)
+                    y_line = exp_model(x_line_num, *popt)
+                    if use_dates:
+                        x_line = mdates.num2date(x_line_num + x_fit_origin)
+                    else:
+                        x_line = x_line_num
+                    plt.plot(
+                        x_line,
+                        y_line,
+                        color='magenta',
+                        linewidth=2.0,
+                        linestyle='-',
+                        label=(
+                            f'Exp fit avg: $\\tau={popt[2]:.4e}\\pm{perr[2]:.4e}\\,{fit_x_unit}$, '
+                            f'$\\chi^2/\\mathrm{{DOF}}={red_chi2:.1f}$'
+                        )
+                    )
+            except Exception as e:
+                print(f"Warning: {fit_model} fit failed for highlight average evolution. Error: {e}")
+
+        plt.ylabel('Highlight Peak (P.E.)')
+        plt.xlabel(x_label)
+        plt.title(f'Highlight Peak Evolution by Run ({self.agg_label}, {self.m1_or_m2})')
+        plt.grid(True, which='major', linestyle='-', linewidth=0.7)
+        plt.grid(True, which='minor', linestyle=':', linewidth=0.5)
+        plt.minorticks_on()
+        ax = plt.gca()
+        self._format_evolution_xaxis(ax, run_df, use_dates)
+        plt.legend(ncol=int(plot_cfg.get('legend_ncol', 3)), fontsize='medium')
+        plt.tight_layout()
+
+        img_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_highlight_peak_evolution.png"
+        pkl_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_highlight_peak_evolution.pkl"
+        csv_path = self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_highlight_peak_evolution.csv"
+        plt.savefig(img_path, dpi=int(plot_cfg.get('dpi', 300)))
+        plt.close()
+
+        out_df = run_df[['run', 'run_dir', 'run_start_time']].copy()
+        for ch in range(12):
+            out_df[f'peak_ch{ch}'] = peak_matrix[:, ch]
+            out_df[f'peak_err_ch{ch}'] = err_matrix[:, ch]
+        out_df['peak_avg_12ch'] = avg_vals
+        out_df['peak_avg_err_12ch'] = avg_err
+        if use_dates:
+            out_df['run_datetime'] = pd.to_datetime(run_df['run_datetime']).dt.strftime('%Y-%m-%d %H:00')
+        else:
+            out_df['run_datetime'] = pd.NA
+
+        with open(pkl_path, 'wb') as f:
+            pickle.dump({
+                'plot_data': out_df.to_dict(orient='list'),
+                'fit_model': fit_model,
+                'fit_params': fit_params,
+                'fit_param_err': fit_param_err,
+                'fit_x_unit': fit_x_unit,
+                'fit_x_origin': fit_x_origin
+            }, f)
+        out_df.to_csv(csv_path, index=False)
+        print(f"Highlight peak evolution plot saved to {img_path}")
+
+    def _generate_low_light_plots(self):
+        """Generate low-light fit plots."""
+        if self.ll_data_found:
+            print("Plotting aggregated Low-Light data...")
+            plot_cfg = get_master_plot_config('low_light_channels', {
+                'fit_range': config.LOW_LIGHT_FIT_RANGE,
+            })
+            self.binned_plotter.fit_and_plot_low_light_from_binned_data(
+                self.master_ll_hist_counts,
+                self.ll_bin_edges,
+                self.master_output_dir,
+                self.agg_label,
+                self.m1_or_m2,
+                hist_range=tuple(plot_cfg.get('fit_range', config.LOW_LIGHT_FIT_RANGE)),
+                plot_config=plot_cfg,
+            )
+        else:
+            print("No Low-Light data found to plot.")
+
+    def _generate_sipm_plots(self):
+        """Generate SiPM histogram plots."""
+        if self.sipm_data_found:
+            print("Plotting aggregated SiPM area data...")
+            sipm_cfg = get_master_plot_config('sipm_area_hist', dict(config.SIPM_HIST_CONFIG))
+            self.binned_plotter.plot_sipm_histograms_from_binned_data(
+                self.master_sipm_hist_counts, 
+                self.sipm_bin_edges, 
+                self.master_output_dir, 
+                self.agg_label, 
+                self.m1_or_m2, 
+                sipm_cfg
+            )
+        else:
+            print("No SiPM data found to plot.")
+
+    def _generate_sipm_noise_ratio_plots(self):
+        """Generate SiPM noise ratio (area/pulseH) histogram plots."""
+        if self.noise_ratio_data_found:
+            print("Plotting aggregated SiPM noise ratio data...")
+            noise_cfg = get_master_plot_config('sipm_noise_ratio_hist', dict(config.SIPM_NOISE_HIST_CONFIG))
+            threshold = config.SIPM_NOISE_HIST_CONFIG.get('threshold', 30.0)
+            suptitle = f'SiPM Channel Area/PulseHeight (triggerBits>=32, pulseH>{threshold:.0f}) - {self.agg_label} ({self.m1_or_m2})'
+            self.binned_plotter.plot_sipm_histograms_from_binned_data(
+                self.master_noise_ratio_counts,
+                self.noise_ratio_bin_edges,
+                self.master_output_dir,
+                self.agg_label,
+                self.m1_or_m2,
+                noise_cfg,
+                suptitle=suptitle,
+                xlabel='Area / Pulse Height',
+                filename_suffix='sipm_noise_ratio_histograms',
+            )
+        else:
+            print("No SiPM noise ratio data found to plot.")
+
+    def _generate_thin_veto_plots(self):
+        """Generate thin veto comparison plots."""
+        if self.master_tv_muon_h_counts is not None:
+            print("Aggregating Thin Veto data...")
+            height_cfg = get_master_plot_config('thin_veto_height_comparison', {
+                'figure_size': (10, 6),
+                'dpi': 300,
+            })
+            area_cfg = get_master_plot_config('thin_veto_area_comparison', {
+                'figure_size': (10, 6),
+                'dpi': 300,
+            })
+
+            height_img_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_thin_veto_height_comparison_master.png'
+            self.binned_plotter.plot_normalized_histogram_comparison_from_binned_data(
+                self.master_tv_muon_h_counts, 'Muon Events (Coincidence)', 
+                self.master_tv_no_co_h_counts, 'All Triggered Events',
+                self.tv_height_bin_edges, height_img_path, 
+                f'Master Thin Veto Height Comparison - {self.agg_label}',
+                'Pulse Height (ADC)', self.m1_or_m2,
+                figsize=tuple(height_cfg.get('figure_size', (10, 6))),
+                dpi=int(height_cfg.get('dpi', 300)),
+            )
+            
+            area_img_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_thin_veto_area_comparison_master.png'
+            self.binned_plotter.plot_normalized_histogram_comparison_from_binned_data(
+                self.master_tv_muon_a_counts, 'Muon Events (Coincidence)', 
+                self.master_tv_no_co_a_counts, 'All Triggered Events',
+                self.tv_area_bin_edges, area_img_path, 
+                f'Master Thin Veto Area Comparison - {self.agg_label}',
+                'Pulse Area (ADC)', self.m1_or_m2,
+                figsize=tuple(area_cfg.get('figure_size', (10, 6))),
+                dpi=int(area_cfg.get('dpi', 300)),
+            )
+
+    def _generate_brn_plots(self):
+        """Generate BRN analysis plots."""
+        if self.brn_data_found and self.master_brn_hist_counts:
+            print("Aggregating BRN Analysis data...")
+            master_brn_data = {
+                'counts': self.master_brn_hist_counts,
+                'delta_t_edges': self.brn_delta_t_edges,
+                'area_edges': self.brn_area_edges,
+            }
+            if master_brn_data['counts']:
+                self._plot_brn_histograms(master_brn_data)
+            else:
+                print("BRN data was found but failed to merge. Skipping master plots.")
+    
+    def _plot_brn_histograms(self, channel_data):
+        """
+        Plot BRN (Beam-Related Neutron) analysis histograms for SiPM channels.
+        Creates multi-panel plots showing delta_t and area distributions for the
+        BRN-configured SiPM channels.
+        
+        Args:
+            channel_data: Histogram payload with shared edges and per-channel counts.
+        """
+        if not channel_data or not channel_data.get('counts'):
+            print("No BRN channel data to plot.")
+            return
+        
+        print(f"Plotting BRN histograms for {len(channel_data['counts'])} channels...")
+        
+        # Extract BRN configuration
+        brn_dt_cfg = get_master_plot_config('brn_delta_t', {
+            'channels': config.BRN_SIPM_CHANNELS,
+            'range': config.BRN_DELTA_T_RANGE,
+            'bin_width_ns': config.BRN_DELTA_T_BIN_WIDTH_NS,
+            'figure_size': (18, 12),
+            'dpi': 300,
+        })
+        brn_area_cfg = get_master_plot_config('brn_area', {
+            'channels': config.BRN_SIPM_CHANNELS,
+            'range': config.BRN_HIST_CONFIG['area_range'],
+            'bins': config.BRN_HIST_CONFIG['area_bins'],
+            'figure_size': (18, 12),
+            'dpi': 300,
+        })
+        brn_heatmap_cfg = get_master_plot_config('brn_delta_t_area', {
+            'channels': config.BRN_SIPM_CHANNELS,
+            'delta_t_range': config.BRN_DELTA_T_RANGE,
+            'area_range': config.BRN_HIST_CONFIG['area_range'],
+            'figure_size': (18, 12),
+            'dpi': 300,
+            'cmap': (getattr(config, 'BRN_HIST_CONFIG', {}) or {}).get('heatmap_cmap', 'viridis'),
+            'logscale': bool((getattr(config, 'BRN_HIST_CONFIG', {}) or {}).get('heatmap_logscale', True)),
+        })
+        brn_channels = list(brn_dt_cfg.get('channels', config.BRN_SIPM_CHANNELS))
+        delta_t_range = tuple(brn_dt_cfg.get('range', config.BRN_DELTA_T_RANGE))
+        area_range = tuple(brn_area_cfg.get('range', config.BRN_HIST_CONFIG['area_range']))
+        beam_on_total = int(self.total_brn_beam_on_count)
+        delta_t_bins = np.asarray(channel_data.get('delta_t_edges', self.brn_delta_t_edges), dtype=float)
+        area_bin_edges = np.asarray(channel_data.get('area_edges', self.brn_area_edges), dtype=float)
+        channel_counts = channel_data.get('counts', {})
+
+        def _style_brn_axis(ax, xlabel, ylabel, xlim):
+            ax.set_xlabel(xlabel, fontsize=11)
+            ax.set_ylabel(ylabel, fontsize=11)
+            ax.set_xlim(xlim)
+            ax.minorticks_on()
+            ax.grid(True, which='major', linestyle='-', linewidth=0.65, alpha=0.35)
+            ax.grid(True, which='minor', linestyle=':', linewidth=0.45, alpha=0.25)
+            ax.tick_params(axis='both', which='both', direction='in', top=True, right=True, labelsize=10)
+            ax.tick_params(axis='x', which='both', labelbottom=True)
+            for spine in ax.spines.values():
+                spine.set_linewidth(1.0)
+        
+        # --- Plot Delta_t Histograms ---
+        fig_dt, axes_dt = plt.subplots(3, 4, figsize=tuple(brn_dt_cfg.get('figure_size', (18, 12))), sharex=True)
+        fig_dt.suptitle(
+            f'Beam-Related Neutron Candidate Timing by SiPM Channel\n{self.agg_label} ({self.m1_or_m2})',
+            fontsize=17,
+            fontweight='bold'
+        )
+        axes_dt = axes_dt.flatten()
+        
+        brn_delta_t_data = {}
+        
+        for i, ch in enumerate(brn_channels):
+            ax = axes_dt[i]
+            if ch in channel_counts and 'delta_t' in channel_counts[ch]:
+                counts = np.asarray(channel_counts[ch]['delta_t'], dtype=float)
+                raw_candidate_count = int(np.sum(counts))
+                if raw_candidate_count > 0:
+
+                    legend_label = (
+                        f"BRN candidates: {raw_candidate_count:,}\n"
+                        f"Beam-on triggers: {beam_on_total:,}"
+                    )
+
+                    ax.step(
+                        delta_t_bins,
+                        np.append(counts, counts[-1]),
+                        where='post',
+                        color='navy',
+                        linewidth=1.8,
+                        label=legend_label
+                    )
+                    
+                    brn_delta_t_data[ch] = {'counts': counts, 'edges': delta_t_bins}
+                    ax.set_title(f'SiPM Channel {ch}', fontsize=12.5, pad=8)
+                    _style_brn_axis(ax, '$\\Delta t$ (ns)', 'Events', delta_t_range)
+                    ax.legend(loc='upper right', fontsize=8.5, frameon=True, framealpha=0.95, edgecolor='0.35')
+                else:
+                    ax.text(0.5, 0.5, f'Channel {ch}\nNo Events', 
+                           ha='center', va='center', transform=ax.transAxes)
+                    ax.set_axis_off()
+            else:
+                ax.text(0.5, 0.5, f'Channel {ch}\nNo Data', 
+                       ha='center', va='center', transform=ax.transAxes)
+                ax.set_axis_off()
+        
+        # Hide unused subplots
+        for i in range(len(brn_channels), len(axes_dt)):
+            axes_dt[i].set_axis_off()
+        
+        plt.tight_layout(rect=[0.02, 0.03, 1, 0.95])
+        
+        dt_img_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_brn_delta_t_master.png'
+        dt_pkl_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_brn_delta_t_master.pkl'
+        plt.savefig(dt_img_path, dpi=int(brn_dt_cfg.get('dpi', 300)), bbox_inches='tight')
+        self.file_handler.save_pickle(brn_delta_t_data, dt_pkl_path)
+        print(f"BRN Delta_t histograms saved to {dt_img_path}")
+        plt.close(fig_dt)
+        
+        # --- Plot Area Histograms ---
+        fig_area, axes_area = plt.subplots(3, 4, figsize=tuple(brn_area_cfg.get('figure_size', (18, 12))), sharex=True)
+        fig_area.suptitle(
+            f'Beam-Related Neutron Candidate Charge by SiPM Channel\n{self.agg_label} ({self.m1_or_m2})',
+            fontsize=17,
+            fontweight='bold'
+        )
+        axes_area = axes_area.flatten()
+        
+        brn_area_data = {}
+        
+        for i, ch in enumerate(brn_channels):
+            ax = axes_area[i]
+            if ch in channel_counts and 'area' in channel_counts[ch]:
+                counts = np.asarray(channel_counts[ch]['area'], dtype=float)
+                raw_candidate_count = int(np.sum(np.asarray(channel_counts[ch].get('delta_t', []), dtype=float)))
+                if raw_candidate_count > 0:
+
+                    legend_label = (
+                        f"BRN candidates: {raw_candidate_count:,}\n"
+                        f"Beam-on triggers: {beam_on_total:,}"
+                    )
+
+                    ax.step(
+                        area_bin_edges,
+                        np.append(counts, counts[-1]),
+                        where='post',
+                        color='darkcyan',
+                        linewidth=1.8,
+                        label=legend_label
+                    )
+                    
+                    brn_area_data[ch] = {'counts': counts, 'edges': area_bin_edges}
+                    ax.set_title(f'SiPM Channel {ch}', fontsize=12.5, pad=8)
+                    _style_brn_axis(ax, 'Area (ADC)', 'Events', area_range)
+                    ax.legend(loc='upper right', fontsize=8.5, frameon=True, framealpha=0.95, edgecolor='0.35')
+                else:
+                    ax.text(0.5, 0.5, f'Channel {ch}\nNo Events', 
+                           ha='center', va='center', transform=ax.transAxes)
+                    ax.set_axis_off()
+            else:
+                ax.text(0.5, 0.5, f'Channel {ch}\nNo Data', 
+                       ha='center', va='center', transform=ax.transAxes)
+                ax.set_axis_off()
+        
+        # Hide unused subplots
+        for i in range(len(brn_channels), len(axes_area)):
+            axes_area[i].set_axis_off()
+        
+        plt.tight_layout(rect=[0.02, 0.03, 1, 0.95])
+        
+        area_img_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_brn_area_master.png'
+        area_pkl_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_brn_area_master.pkl'
+        plt.savefig(area_img_path, dpi=int(brn_area_cfg.get('dpi', 300)), bbox_inches='tight')
+        self.file_handler.save_pickle(brn_area_data, area_pkl_path)
+        print(f"BRN Area histograms saved to {area_img_path}")
+        plt.close(fig_area)
+
+        # --- Plot Delta_t vs Area Heatmaps ---
+        fig_heatmap, axes_heatmap = plt.subplots(
+            3, 4,
+            figsize=tuple(brn_heatmap_cfg.get('figure_size', (18, 12))),
+            sharex=True,
+            sharey=True,
+        )
+        fig_heatmap.suptitle(
+            f'Beam-Related Neutron Candidate Δt vs Charge by SiPM Channel\n{self.agg_label} ({self.m1_or_m2})',
+            fontsize=17,
+            fontweight='bold'
+        )
+        axes_heatmap = axes_heatmap.flatten()
+
+        heatmap_cmap = brn_heatmap_cfg.get('cmap', 'viridis')
+        heatmap_logscale = bool(brn_heatmap_cfg.get('logscale', True))
+        heatmap_payload = {
+            'delta_t_edges': delta_t_bins,
+            'area_edges': area_bin_edges,
+            'counts': {},
+        }
+        heatmap_artist = None
+        active_axes = []
+        max_heatmap_count = 0.0
+
+        for ch in brn_channels:
+            if ch not in channel_counts or 'delta_t_area' not in channel_counts[ch]:
+                continue
+            counts_2d = np.asarray(channel_counts[ch]['delta_t_area'], dtype=float)
+            if counts_2d.size > 0:
+                max_heatmap_count = max(max_heatmap_count, float(np.max(counts_2d)))
+
+        norm = Normalize(vmin=0.0, vmax=max_heatmap_count if max_heatmap_count > 0 else 1.0)
+        if heatmap_logscale and max_heatmap_count > 1.0:
+            norm = SymLogNorm(linthresh=1.0, linscale=1.0, vmin=0.0, vmax=max_heatmap_count, base=10)
+
+        for i, ch in enumerate(brn_channels):
+            ax = axes_heatmap[i]
+            if ch in channel_counts and 'delta_t_area' in channel_counts[ch]:
+                counts_2d = np.asarray(channel_counts[ch]['delta_t_area'], dtype=float)
+                if counts_2d.size > 0 and np.any(counts_2d > 0):
+                    heatmap_artist = ax.pcolormesh(
+                        delta_t_bins,
+                        area_bin_edges,
+                        counts_2d.T,
+                        shading='auto',
+                        cmap=heatmap_cmap,
+                        norm=norm,
+                    )
+                    heatmap_payload['counts'][ch] = counts_2d
+                    ax.set_title(f'SiPM Channel {ch}', fontsize=12.5, pad=8)
+                    _style_brn_axis(ax, '$\\Delta t$ (ns)', 'Area (ADC)', tuple(brn_heatmap_cfg.get('delta_t_range', delta_t_range)))
+                    ax.set_ylim(tuple(brn_heatmap_cfg.get('area_range', area_range)))
+                    ax.grid(False)
+                    active_axes.append(ax)
+                else:
+                    ax.text(0.5, 0.5, f'Channel {ch}\nNo Events', ha='center', va='center', transform=ax.transAxes)
+                    ax.set_axis_off()
+            else:
+                ax.text(0.5, 0.5, f'Channel {ch}\nNo Data', ha='center', va='center', transform=ax.transAxes)
+                ax.set_axis_off()
+
+        for i in range(len(brn_channels), len(axes_heatmap)):
+            axes_heatmap[i].set_axis_off()
+
+        if heatmap_artist is not None and active_axes:
+            fig_heatmap.subplots_adjust(left=0.06, right=0.90, bottom=0.07, top=0.92, wspace=0.22, hspace=0.28)
+            cax = fig_heatmap.add_axes([0.92, 0.12, 0.018, 0.72])
+            colorbar = fig_heatmap.colorbar(heatmap_artist, cax=cax)
+            colorbar.set_label('Events')
+        else:
+            fig_heatmap.subplots_adjust(left=0.06, right=0.96, bottom=0.07, top=0.92, wspace=0.22, hspace=0.28)
+
+        heatmap_img_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_brn_delta_t_area_master.png'
+        heatmap_pkl_path = self.master_output_dir / f'{self.filename_label}_{self.m1_or_m2}_brn_delta_t_area_master.pkl'
+        plt.savefig(heatmap_img_path, dpi=int(brn_heatmap_cfg.get('dpi', 300)), bbox_inches='tight')
+        self.file_handler.save_pickle(heatmap_payload, heatmap_pkl_path)
+        print(f"BRN Delta_t vs Area heatmaps saved to {heatmap_img_path}")
+        plt.close(fig_heatmap)
+
+    def _save_run_info(self):
+        """Save configuration and run information to a text file."""
+        info_file = self.master_output_dir / "run_info.txt"
+        
+        with open(info_file, "w") as f:
+            f.write(f"Analysis Run Information\n")
+            f.write(f"========================\n\n")
+            f.write(f"Run Range: {self.run_range_str}\n")
+            f.write(f"M1/M2: {self.m1_or_m2}\n")
+            f.write(f"Number of Sub-jobs: {len(self.subjob_dirs)}\n")
+            f.write(f"Top Directory: {self.top_dir}\n\n")
+            
+            f.write(f"Configuration Parameters\n")
+            f.write(f"------------------------\n")
+            f.write(f"DATA_DIR_M1: {config.DATA_DIR_M1}\n")
+            f.write(f"DATA_DIR_M2: {config.DATA_DIR_M2}\n")
+            f.write(f"TIME_INTERVAL_CUT_NS: {config.TIME_INTERVAL_CUT_NS}\n")
+            f.write(f"DELTA_T_CUT: {config.DELTA_T_CUT}\n")
+            f.write(f"PE_CUT: {config.PE_CUT}\n")
+            f.write(f"TIME_STD_CUT: {config.TIME_STD_CUT}\n")
+            f.write(f"MULTIPLICITY_SPE: {config.MULTIPLICITY_SPE}\n")
+            f.write(f"MULTIPLICITY_CUT: {config.MULTIPLICITY_CUT}\n")
+            f.write(f"TIME_TICK_NS: {config.TIME_TICK_NS}\n")
+            f.write(f"DELTA_T_BIN_WIDTH_NS: {config.DELTA_T_BIN_WIDTH_NS}\n")
+            f.write(f"TAU_FIT_WINDOW: {config.TAU_FIT_WINDOW}\n")
+            f.write(f"LOW_LIGHT_FIT_RANGE: {config.LOW_LIGHT_FIT_RANGE}\n")
+            f.write(f"HIGHLIGHT_FIT_CONFIG: {getattr(config, 'HIGHLIGHT_FIT_CONFIG', {})}\n")
+            f.write(f"SIPM_HIST_CONFIG: {config.SIPM_HIST_CONFIG}\n")
+            f.write(f"PERFORM_THIN_VETO_ANALYSIS: {config.PERFORM_THIN_VETO_ANALYSIS}\n")
+            f.write(f"PERFORM_BRN_ANALYSIS: {config.PERFORM_BRN_ANALYSIS}\n")
+            f.write(f"ENABLE_EVENT61_SYNTHETIC_BIT: {getattr(config, 'ENABLE_EVENT61_SYNTHETIC_BIT', False)}\n")
+            f.write(f"EVENT61_CHANNEL_INDEX: {getattr(config, 'EVENT61_CHANNEL_INDEX', 22)}\n")
+            f.write(f"EVENT61_ADC_RANGE: {getattr(config, 'EVENT61_ADC_RANGE', None)}\n")
+            f.write(f"EVENT61_THRESHOLD_ADC_LOWER_EDGE: {getattr(config, 'EVENT61_THRESHOLD_ADC', 15.0)}\n")
+            f.write(f"EVENT61_FIT_CONFIG: {getattr(config, 'EVENT61_FIT_CONFIG', {})}\n")
+            f.write(f"MASTER_PLOT_CONFIG: {getattr(config, 'MASTER_PLOT_CONFIG', {})}\n")
+            f.write(f"Legacy Total Beam-on Count: {self.total_beam_on_count}\n")
+            f.write(f"BRN Total Beam-on Count: {self.total_brn_beam_on_count}\n")
+            f.write(f"Runs With Event61 Adjustment Applied: {self.event61_applied_run_count}\n")
+            f.write(f"Observed Event61 ADC Ranges: {sorted(self.event61_adc_ranges)}\n")
+            f.write(f"Observed Event61 Channel Indices: {sorted(self.event61_channel_indices)}\n")
+            
+            f.write(f"\nSub-job Directories Processed:\n")
+            for d in self.subjob_dirs:
+                f.write(f"  {d.name}\n")
+            
+        print(f"Run info saved to {info_file}")
+
+    def run(self):
+        """Run the full aggregation process."""
+        self._load_all_subjob_data()
+        self._generate_master_plots()
+        self._save_total_time_length()
+        self._save_run_info()
+        print("\n--- Master Aggregation Complete ---")
+
+def main():
+    """Script entry point."""
+    if len(sys.argv) != 2:
+        print("Usage: python aggregate_master_veto.py <top_level_analysis_directory>")
+        sys.exit(1)
+    
+    try:
+        aggregator = MasterAggregator(sys.argv[1])
+        aggregator.run()
+    except (FileNotFoundError, Exception) as e:
+        print(f"An error occurred: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
