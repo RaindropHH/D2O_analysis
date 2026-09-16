@@ -11,9 +11,9 @@ SCRIPT_DIR="/raid1/hexiangh/D2O_analysis/Codes"
 RUN_SCRIPT_DIR="/raid1/hexiangh/D2O_analysis/Codes"
 
 # Hardcoded Run Parameters
-start_run=4988
-end_run=5388
-step=10  # NEW: Process every Nth run
+start_run=4598
+end_run=4766
+step=1  # NEW: Process every Nth run
 M1_or_M2="M2"
 njobs=10
 partition="red" # blue red green

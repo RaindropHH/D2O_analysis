@@ -83,7 +83,7 @@ Data lands in `M1_data/` (Module 1) or `M2_data/` (Module 2), organized by run n
 1. Reads ROOT trees via **uproot** + **awkward** in chunks
 2. Converts ADC to photoelectrons (PE)
 3. Applies quality cuts: time-std, PE range, PMT multiplicity, delta-t window
-4. Identifies muon events (triggerBit ≥ 34) and veto events (triggerBit = 2)
+4. Identifies muon events (triggerBit ≥ 34) and veto events (triggerBit = 32)
 5. Computes Δt between veto candidates and preceding muons
 6. Fills histograms: Δt, total PE, SiPM pulse-height, SiPM area/height noise ratio, thin-veto, BRN, Event61
 7. Performs low-light (triggerBit = 16) multi-Gaussian SPE fitting

@@ -30,6 +30,11 @@ DELTA_T_CUT = (2400, 32000)      # (min_ns, max_ns), min_ns, max_ns should be n*
 # DELTA_T_CUT = (8*muon_life, 100*muon_life)      # (min_ns, max_ns)
 # DELTA_T_CUT = (960, 10560)      # (min_ns, max_ns)
 PE_CUT = (0, 2000)             # (min_pe, max_pe)
+# Single-PMT-channel Michel electron spectra: per-channel PE is ~1/12 of the
+# summed total-PE scale, so PE_CUT's binning is far too coarse to resolve a
+# single-channel Michel peak -- use a dedicated, finer range/binning.
+MICHEL_CHANNEL_PE_RANGE = (0.0, 200.0)  # (min_pe, max_pe) per PMT channel
+MICHEL_CHANNEL_PE_BINS = 100            # number of bins for single-channel Michel spectra
 TIME_STD_CUT = 2.5 * 16        # Max standard deviation of PMT hit times in an event (ns)
 MULTIPLICITY_SPE = 2         # P.E. threshold to count a PMT as "hit"
 MULTIPLICITY_CUT = 12          # Minimum number of hit PMTs for an event

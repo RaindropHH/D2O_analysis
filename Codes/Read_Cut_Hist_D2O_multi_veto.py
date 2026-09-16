@@ -571,23 +571,32 @@ class DataProcessor:
         self.hist_calc = HistogramCalculator()
         self.file_handler = FileHandler()
 
-    def calculate_total_pe(self, df, mu1_values):
-        """Calculates the total photoelectrons for each event using per-channel gain."""
+    def calculate_pe_per_channel(self, df, mu1_values):
+        """Calculates the per-PMT-channel photoelectrons for each event using per-channel gain.
+
+        Returns an (n_events, 12) array, one column per config.PMT_CHANNELS entry.
+        Shared by calculate_total_pe() (summed over channels) and the single-channel
+        Michel spectrum histogramming in RunProcessor._save_cut_histograms(), so both
+        paths use identical P.E. calibration.
+        """
         if np.all(np.isnan(mu1_values)):
             print("ERROR: Low-light fit failed. Cannot calculate photoelectrons.")
-            return np.full(len(df), np.nan)
+            return np.full((len(df), len(config.PMT_CHANNELS)), np.nan)
 
         mu1_safe = np.where(np.isnan(mu1_values) | (mu1_values <= 0), np.inf, mu1_values)
         if np.any(mu1_safe == np.inf):
             nan_ch = np.where(np.isnan(mu1_values) | (mu1_values <= 0))[0]
             print(f"Warning: mu1 fit failed/invalid for channels {nan_ch}. These channels will be excluded from the P.E. sum.")
-        
+
         area_data_np = np.array(df['area_array'].to_list())[:, config.PMT_CHANNELS]
         pe_per_channel = area_data_np / mu1_safe
         pe_per_channel = np.clip(pe_per_channel, 0.0, None)
-        total_pe = np.sum(pe_per_channel, axis=1)
-        
-        return total_pe
+        return pe_per_channel
+
+    def calculate_total_pe(self, df, mu1_values):
+        """Calculates the total photoelectrons for each event using per-channel gain."""
+        pe_per_channel = self.calculate_pe_per_channel(df, mu1_values)
+        return np.sum(pe_per_channel, axis=1)
 
     def compute_delta_t(self, df, muon_bits, veto_bits, mult_thresh):
         """Compute time differences Δt between veto events and the preceding muon event."""
@@ -1432,6 +1441,69 @@ class Plotter:
         print(f"Michel electron spectrum data saved to {pkl_path}")
         return payload
 
+    def plot_michel_spectrum_per_channel(self, channel_counts, edges, img_path, pkl_path, title, M1_or_M2):
+        """Plot single-PMT-channel Michel electron spectra, one panel per channel.
+
+        Mirrors plot_michel_spectrum() (the 12-channel-summed version) but takes a
+        dict of 12 already-binned per-channel total-PE histograms -- e.g. one run's
+        histograms, or several runs' histograms summed together -- fits a
+        Gaussian+constant in the FWHM window for each channel independently, and
+        saves one combined 3x4 grid figure plus the per-channel histogram/fit data.
+        """
+        edges = np.asarray(edges, dtype=float)
+        if edges.size < 2 or not channel_counts:
+            print(f"No per-channel Total P.E. histogram data for Michel spectrum ({title}). Skipping.")
+            return None
+
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        bin_width = float(np.median(np.diff(edges)))
+
+        fig, axes = plt.subplots(3, 4, figsize=(22, 14))
+        fig.suptitle(f'Single-PMT-Channel Michel Electron Spectra: {title} ({M1_or_M2})', fontsize=18)
+        axes = axes.flatten()
+
+        channel_payload = {}
+        for ch in range(12):
+            ax = axes[ch]
+            counts = np.asarray(channel_counts.get(ch, np.zeros_like(centers)), dtype=float)
+            errors = np.sqrt(counts)
+            fit = fit_michel_gaussian_fwhm(centers, counts, errors)
+
+            ax.errorbar(centers, counts, yerr=errors, fmt='o', markersize=2.5, capsize=1.5,
+                        color='black', ecolor='gray', zorder=2)
+            if fit['success']:
+                fit_x = np.asarray(fit['fit_x'], dtype=float)
+                fit_y = np.asarray(fit['fit_y'], dtype=float)
+                ax.plot(fit_x, fit_y, color='tab:red', linewidth=2.0, zorder=3)
+                ax.axvspan(fit['fwhm_min'], fit['fwhm_max'], color='tab:red', alpha=0.12)
+                ax.set_title(
+                    f"ch{ch:02d}: $\\mu$={fit['peak_location']:.2f}±{fit['peak_location_error']:.2f}, "
+                    f"$\\sigma$={fit['sigma']:.2f}±{fit['sigma_error']:.2f} p.e.",
+                    fontsize=12
+                )
+            else:
+                ax.set_title(f"ch{ch:02d}: fit failed", fontsize=12)
+            ax.set_xlabel('P.E.')
+            ax.set_ylabel(f'Counts/{bin_width:.1f} P.E.')
+            ax.grid(True, alpha=0.3)
+
+            channel_payload[ch] = {
+                'centers': centers,
+                'counts': counts,
+                'errors': errors,
+                'michel_fit': fit,
+            }
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        self.file_handler.ensure_dir(img_path.parent)
+        plt.savefig(img_path)
+        plt.close()
+
+        self.file_handler.save_pickle(channel_payload, pkl_path)
+        print(f"Single-channel Michel electron spectra plot saved to {img_path}")
+        print(f"Single-channel Michel electron spectra data saved to {pkl_path}")
+        return channel_payload
+
 class RunProcessor:
     """Main class for processing individual runs."""
     
@@ -1633,7 +1705,7 @@ class RunProcessor:
         # Apply cuts and generate veto efficiency plots
         cut_payload, pe_trig2, pe_trig2_or_34, veto_summary, michel_summary = self._apply_cuts_and_generate_plots(
             df_all, run, hist_dir, cut_dir, delta_t_cut, pe_cut, bins, veto_bins,
-            vetorange, multiplicity_cut, time_std_cut, logscale, M1_or_M2
+            vetorange, multiplicity_cut, time_std_cut, logscale, M1_or_M2, mu1_values_run
         )
         veto_hist_payload = self._build_veto_hist_payload(
             pe_trig2.to_numpy(), pe_trig2_or_34.to_numpy(), bins, veto_bins, vetorange, pe_cut
@@ -2662,7 +2734,7 @@ class RunProcessor:
 
     def _apply_cuts_and_generate_plots(self, df_all, run, hist_dir, cut_dir, delta_t_cut, pe_cut,
                                      bins, veto_bins, vetorange, multiplicity_cut, time_std_cut,
-                                     logscale, M1_or_M2):
+                                     logscale, M1_or_M2, mu1_values):
         """Apply event selection cuts and generate plots."""
         pe_min, pe_max = pe_cut
         
@@ -2705,7 +2777,8 @@ class RunProcessor:
         # Process delta T analysis
         events = self.data_processor.compute_delta_t(df_all, muon_bits=32, veto_bits=2, mult_thresh=multiplicity_cut)
         cut_payload = self._save_cut_histograms(events, delta_t_cut, pe_cut, bins, cut_dir,
-                                               f"Run {run}", time_std_cut, M1_or_M2, logscale)
+                                               f"Run {run}", time_std_cut, M1_or_M2, logscale,
+                                               mu1_values)
 
         if cut_payload is None:
             main_hist_payload = None
@@ -2828,7 +2901,8 @@ class RunProcessor:
         return mu1_values, mu1_errors, fit_results_data
 
     def _save_cut_histograms(self, events, delta_t_range, pe_range, bins,
-                           save_dir, run_label, time_std_cut, M1_or_M2, logscale=True):
+                           save_dir, run_label, time_std_cut, M1_or_M2, logscale=True,
+                           mu1_values=None):
         """Apply sequential cuts and save errorbar histograms."""
         dt_min, dt_max = delta_t_range
         pe_min, pe_max = pe_range
@@ -2949,6 +3023,23 @@ class RunProcessor:
         plt.savefig(save_dir / f'{pe_base_filename}.png')
         plt.close()
 
+        # Single-PMT-channel Michel electron spectra: same candidate events ('sel')
+        # as the 12-channel-summed total_pe histogram above, but histogrammed
+        # per channel using calculate_pe_per_channel() (dedicated finer binning,
+        # since a single channel's PE scale is ~1/12 of the summed total_pe scale).
+        michel_channel_hist_counts = None
+        michel_channel_hist_edges = None
+        if mu1_values is not None and 'area_array' in sel.columns and not sel.empty:
+            channel_pe = self.data_processor.calculate_pe_per_channel(sel, mu1_values)
+            channel_edges = np.linspace(
+                config.MICHEL_CHANNEL_PE_RANGE[0], config.MICHEL_CHANNEL_PE_RANGE[1],
+                config.MICHEL_CHANNEL_PE_BINS + 1
+            )
+            michel_channel_hist_counts = {}
+            for ch in range(channel_pe.shape[1]):
+                michel_channel_hist_counts[ch], _ = np.histogram(channel_pe[:, ch], bins=channel_edges)
+            michel_channel_hist_edges = channel_edges
+
         return {
             'delta_t': sel['delta_t'].values,
             'total_pe': sel['total_pe'].values,
@@ -2957,7 +3048,9 @@ class RunProcessor:
             'delta_t_hist_edges': dt_edges,
             'total_pe_hist_counts': pe_counts,
             'total_pe_hist_edges': pe_edges,
-            'michel_fit': michel_fit
+            'michel_fit': michel_fit,
+            'michel_channel_hist_counts': michel_channel_hist_counts,
+            'michel_channel_hist_edges': michel_channel_hist_edges,
         }
 
 def main():
@@ -2997,6 +3090,8 @@ def main():
         'delta_t_edges': None,
         'total_pe_hist': None,
         'total_pe_edges': None,
+        'michel_channel_hists': None,
+        'michel_channel_edges': None,
         'event61_hist': None,
         'event61_edges': None,
         'sipm_area_hists': None,
@@ -3067,7 +3162,22 @@ def main():
                         main_hist_payload['total_pe_hist_edges'],
                         'total_pe'
                     )
-                
+
+                    michel_ch_counts = main_hist_payload.get('michel_channel_hist_counts')
+                    michel_ch_edges = main_hist_payload.get('michel_channel_hist_edges')
+                    if michel_ch_counts is not None and michel_ch_edges is not None:
+                        if aggregated['michel_channel_hists'] is None:
+                            aggregated['michel_channel_hists'] = {
+                                ch: np.asarray(counts, dtype=float).copy()
+                                for ch, counts in michel_ch_counts.items()
+                            }
+                            aggregated['michel_channel_edges'] = np.asarray(michel_ch_edges, dtype=float).copy()
+                        else:
+                            if aggregated['michel_channel_edges'].shape != np.asarray(michel_ch_edges).shape or not np.allclose(aggregated['michel_channel_edges'], np.asarray(michel_ch_edges, dtype=float)):
+                                raise ValueError("Michel single-channel histogram edge mismatch across runs")
+                            for ch, counts in michel_ch_counts.items():
+                                aggregated['michel_channel_hists'][ch] += np.asarray(counts, dtype=float)
+
                 # Low-light histogram data
                 aggregated['low_light_hists'].append(ll_hists)
                 if ll_bin_edges_agg is None: 
@@ -3211,6 +3321,18 @@ def main():
                 output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_spectrum.pkl",
                 f"Runs {start_run}-{end_run}", M1_or_M2,
                 logscale=False
+            )
+        if aggregated['michel_channel_hists'] is not None and aggregated['michel_channel_edges'] is not None:
+            FileHandler.save_pickle(
+                {'counts': aggregated['michel_channel_hists'], 'edges': aggregated['michel_channel_edges']},
+                output_dir / 'aggregated_michel_channel_hists.pkl'
+            )
+            processor.plotter.plot_michel_spectrum_per_channel(
+                aggregated['michel_channel_hists'],
+                aggregated['michel_channel_edges'],
+                output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_spectrum_per_channel.png",
+                output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_spectrum_per_channel.pkl",
+                f"Runs {start_run}-{end_run}", M1_or_M2
             )
         if aggregated['event61_hist'] is not None and aggregated['event61_edges'] is not None:
             FileHandler.save_pickle(

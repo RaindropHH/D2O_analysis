@@ -1143,6 +1143,11 @@ class MasterAggregator:
         self.master_pe_counts = np.zeros(len(self.main_pe_bin_edges) - 1, dtype=float)
         self.main_data_found = False
 
+        # Single-PMT-channel Michel electron spectra (finer-binned, per-channel P.E.)
+        self.michel_channel_bin_edges = None
+        self.master_michel_channel_hist_counts = None
+        self.michel_channel_data_found = False
+
         event61_cfg = get_event61_fit_config()
         self.event61_bin_edges = np.linspace(*event61_cfg['hist_range'], event61_cfg['bins'] + 1)
         self.master_event61_hist_counts = np.zeros(len(self.event61_bin_edges) - 1, dtype=float)
@@ -1261,6 +1266,7 @@ class MasterAggregator:
             print(f"Processing {sub_dir.name}...")
             
             self._load_main_arrays(sub_dir)
+            self._load_michel_channel_data(sub_dir)
             self._load_event61_data(sub_dir)
             self._load_sipm_data(sub_dir)
             self._load_sipm_noise_ratio_data(sub_dir)
@@ -1701,6 +1707,31 @@ class MasterAggregator:
             except Exception as e:
                 print(f"  Warning: Could not read run-level veto summary from {summary_file}. Error: {e}")
 
+    def _load_michel_channel_data(self, sub_dir):
+        """Load and sum single-PMT-channel Michel electron histogram data."""
+        michel_ch_file = sub_dir / 'aggregated_michel_channel_hists.pkl'
+        if michel_ch_file.exists():
+            self.michel_channel_data_found = True
+            try:
+                with open(michel_ch_file, 'rb') as f:
+                    michel_ch_data = pickle.load(f)
+                job_michel_ch_counts = michel_ch_data['counts']
+
+                if self.master_michel_channel_hist_counts is None:
+                    self.master_michel_channel_hist_counts = {
+                        ch: np.asarray(counts, dtype=float).copy()
+                        for ch, counts in job_michel_ch_counts.items()
+                    }
+                    self.michel_channel_bin_edges = np.asarray(michel_ch_data['edges'], dtype=float)
+                else:
+                    for ch in self.master_michel_channel_hist_counts.keys():
+                        self.master_michel_channel_hist_counts[ch] += np.asarray(
+                            job_michel_ch_counts.get(ch, 0), dtype=float
+                        )
+
+            except Exception as e:
+                print(f"  Warning: Could not process single-channel Michel data for {sub_dir.name}. Error: {e}")
+
     def _load_low_light_data(self, sub_dir):
         """Load and sum low-light histogram data."""
         ll_file = sub_dir / 'aggregated_low_light_hists.pkl'
@@ -2002,6 +2033,17 @@ class MasterAggregator:
                     self.agg_label, self.m1_or_m2,
                     logscale=False
                 )
+
+        if (self.michel_channel_data_found and self.master_michel_channel_hist_counts is not None
+                and any(np.sum(c) > 0 for c in self.master_michel_channel_hist_counts.values())):
+            print("Aggregating single-PMT-channel Michel electron spectra...")
+            self.plotter.plot_michel_spectrum_per_channel(
+                self.master_michel_channel_hist_counts,
+                self.michel_channel_bin_edges,
+                self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_spectrum_per_channel.png",
+                self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_spectrum_per_channel.pkl",
+                self.agg_label, self.m1_or_m2
+            )
 
     def _generate_event61_plots(self):
         """Generate the master Event61 histogram and fit plot."""
