@@ -1057,6 +1057,47 @@ class BRNAnalyzer:
         return payload
 
 
+def histogram_mean_sem(centers, counts):
+    """Mean and standard error of the mean of a binned histogram.
+
+    Treats each histogram entry as a sample at its bin center (i.e. the usual
+    binned-data mean/variance estimator). Distinct from the *peak location*
+    returned by fit_michel_gaussian_fwhm(), which is a mode estimate fit only
+    to the near-peak FWHM window and ignores the distribution's tail -- for a
+    skewed distribution (as single-PMT-channel P.E. spectra are) mode != mean,
+    which is exactly why summing 12 channels' fitted *peaks* does not match
+    the fitted peak of the already-summed spectrum: see mean, below, which
+    -- being linear -- sums exactly across channels while the peak does not.
+    """
+    centers = np.asarray(centers, dtype=float)
+    counts = np.asarray(counts, dtype=float)
+    n = float(np.sum(counts))
+    if n <= 0:
+        return {'mean': np.nan, 'sem': np.nan, 'n': 0.0}
+    mean = float(np.sum(centers * counts) / n)
+    variance = float(np.sum(counts * (centers - mean) ** 2) / n)
+    sem = float(np.sqrt(max(variance, 0.0) / n))
+    return {'mean': mean, 'sem': sem, 'n': n}
+
+
+def mean_sem_from_sums(sum_x, sum_x2, n):
+    """Exact mean and SEM from accumulated sum(x)/sum(x^2)/n sufficient statistics.
+
+    Unlike histogram_mean_sem(), this needs no binning/range at all, so it is
+    unaffected by e.g. MICHEL_CHANNEL_PE_RANGE truncating a per-channel P.E.
+    histogram to just the near-peak region -- the sums here are accumulated
+    from the *full* per-event per-channel P.E. array before any such cut, and
+    add up exactly across runs/subjobs (mean does not).
+    """
+    if n is None or sum_x is None or n <= 0:
+        return {'mean': np.nan, 'sem': np.nan, 'n': 0.0}
+    n = float(n)
+    mean = float(sum_x / n)
+    variance = float(max(sum_x2 / n - mean ** 2, 0.0))
+    sem = float(np.sqrt(variance / n))
+    return {'mean': mean, 'sem': sem, 'n': n}
+
+
 def fit_michel_gaussian_fwhm(centers, counts, errors):
     """Fit Gaussian+constant in the FWHM region around a histogram peak.
 
@@ -1388,6 +1429,7 @@ class Plotter:
         errors = np.sqrt(counts)
 
         fit = fit_michel_gaussian_fwhm(centers, counts, errors)
+        mean_stats = histogram_mean_sem(centers, counts)
 
         plt.figure(figsize=(10, 6))
         plt.errorbar(
@@ -1407,11 +1449,18 @@ class Plotter:
             )
             plt.axvline(
                 fit['peak_location'], color='tab:red', linestyle=':', linewidth=1.6,
-                label=f"Michel peak = {fit['peak_location']:.2f} p.e."
+                label=f"Michel peak (mode) = {fit['peak_location']:.2f} p.e."
             )
             plt.axvspan(
                 fit['fwhm_min'], fit['fwhm_max'], color='tab:red', alpha=0.12,
                 label='FWHM fit window'
+            )
+
+        if np.isfinite(mean_stats['mean']):
+            plt.axvline(
+                mean_stats['mean'], color='tab:blue', linestyle='--', linewidth=1.6,
+                label=f"Histogram mean = {mean_stats['mean']:.2f}±{mean_stats['sem']:.2f} p.e.",
+                zorder=4,
             )
 
         bin_width = float(np.median(np.diff(edges))) if edges.size > 1 else 0.0
@@ -1435,13 +1484,15 @@ class Plotter:
             'counts': counts,
             'errors': errors,
             'michel_fit': fit,
+            'hist_mean': mean_stats,
         }
         self.file_handler.save_pickle(payload, pkl_path)
         print(f"Michel electron spectrum plot saved to {img_path}")
         print(f"Michel electron spectrum data saved to {pkl_path}")
         return payload
 
-    def plot_michel_spectrum_per_channel(self, channel_counts, edges, img_path, pkl_path, title, M1_or_M2):
+    def plot_michel_spectrum_per_channel(self, channel_counts, edges, img_path, pkl_path, title, M1_or_M2,
+                                          channel_sum_pe=None, channel_sum_pe2=None, n_events=None):
         """Plot single-PMT-channel Michel electron spectra, one panel per channel.
 
         Mirrors plot_michel_spectrum() (the 12-channel-summed version) but takes a
@@ -1449,6 +1500,12 @@ class Plotter:
         histograms, or several runs' histograms summed together -- fits a
         Gaussian+constant in the FWHM window for each channel independently, and
         saves one combined 3x4 grid figure plus the per-channel histogram/fit data.
+
+        channel_sum_pe/channel_sum_pe2/n_events (optional): per-channel sum(x),
+        sum(x^2) and shared event count accumulated from the *unbinned* per-channel
+        P.E. array (see RunProcessor._save_cut_histograms), used to display the
+        exact mean -- unaffected by the histogram's MICHEL_CHANNEL_PE_RANGE cutoff.
+        Falls back to the (truncated, biased-low) histogram mean if not given.
         """
         edges = np.asarray(edges, dtype=float)
         if edges.size < 2 or not channel_counts:
@@ -1457,32 +1514,48 @@ class Plotter:
 
         centers = 0.5 * (edges[:-1] + edges[1:])
         bin_width = float(np.median(np.diff(edges)))
+        have_true_mean = channel_sum_pe is not None and channel_sum_pe2 is not None and n_events
 
-        fig, axes = plt.subplots(3, 4, figsize=(22, 14))
+        fig, axes = plt.subplots(3, 4, figsize=(22, 15))
         fig.suptitle(f'Single-PMT-Channel Michel Electron Spectra: {title} ({M1_or_M2})', fontsize=18)
         axes = axes.flatten()
 
         channel_payload = {}
+        mean_sum = 0.0
+        peak_sum = 0.0
         for ch in range(12):
             ax = axes[ch]
             counts = np.asarray(channel_counts.get(ch, np.zeros_like(centers)), dtype=float)
             errors = np.sqrt(counts)
             fit = fit_michel_gaussian_fwhm(centers, counts, errors)
+            if have_true_mean:
+                mean_stats = mean_sem_from_sums(channel_sum_pe[ch], channel_sum_pe2[ch], n_events)
+                mean_label = 'true mean'
+            else:
+                mean_stats = histogram_mean_sem(centers, counts)
+                mean_label = f'hist. mean (<={edges[-1]:.0f} p.e. only)'
 
             ax.errorbar(centers, counts, yerr=errors, fmt='o', markersize=2.5, capsize=1.5,
                         color='black', ecolor='gray', zorder=2)
+            title_lines = [f"ch{ch:02d}:"]
             if fit['success']:
                 fit_x = np.asarray(fit['fit_x'], dtype=float)
                 fit_y = np.asarray(fit['fit_y'], dtype=float)
                 ax.plot(fit_x, fit_y, color='tab:red', linewidth=2.0, zorder=3)
                 ax.axvspan(fit['fwhm_min'], fit['fwhm_max'], color='tab:red', alpha=0.12)
-                ax.set_title(
-                    f"ch{ch:02d}: $\\mu$={fit['peak_location']:.2f}±{fit['peak_location_error']:.2f}, "
-                    f"$\\sigma$={fit['sigma']:.2f}±{fit['sigma_error']:.2f} p.e.",
-                    fontsize=12
+                ax.axvline(fit['peak_location'], color='tab:red', linestyle=':', linewidth=1.4, zorder=4)
+                title_lines.append(
+                    f"peak (mode) $\\mu$={fit['peak_location']:.2f}±{fit['peak_location_error']:.2f}, "
+                    f"$\\sigma$={fit['sigma']:.2f}±{fit['sigma_error']:.2f} p.e."
                 )
+                peak_sum += fit['peak_location']
             else:
-                ax.set_title(f"ch{ch:02d}: fit failed", fontsize=12)
+                title_lines.append("fit failed")
+            if np.isfinite(mean_stats['mean']):
+                ax.axvline(mean_stats['mean'], color='tab:blue', linestyle='--', linewidth=1.4, zorder=4)
+                title_lines.append(f"{mean_label}={mean_stats['mean']:.2f}±{mean_stats['sem']:.2f} p.e.")
+                mean_sum += mean_stats['mean']
+            ax.set_title("\n".join(title_lines), fontsize=11)
             ax.set_xlabel('P.E.')
             ax.set_ylabel(f'Counts/{bin_width:.1f} P.E.')
             ax.grid(True, alpha=0.3)
@@ -1492,9 +1565,22 @@ class Plotter:
                 'counts': counts,
                 'errors': errors,
                 'michel_fit': fit,
+                'true_mean' if have_true_mean else 'hist_mean': mean_stats,
             }
 
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        mean_caveat = (
+            "" if have_true_mean else
+            f"   (note: per-channel P.E. range is truncated at {edges[-1]:.0f} p.e., so this sum is a lower bound on the true mean)"
+        )
+        fig.text(
+            0.5, 0.005,
+            (
+                f"red dotted = per-channel fitted peak (mode), $\\Sigma$ = {peak_sum:.2f} p.e.   |   "
+                f"blue dashed = per-channel {mean_label}, $\\Sigma$ = {mean_sum:.2f} p.e.{mean_caveat}"
+            ),
+            ha='center', fontsize=11, color='dimgray'
+        )
+        plt.tight_layout(rect=[0, 0.02, 1, 0.96])
         self.file_handler.ensure_dir(img_path.parent)
         plt.savefig(img_path)
         plt.close()
@@ -1502,6 +1588,9 @@ class Plotter:
         self.file_handler.save_pickle(channel_payload, pkl_path)
         print(f"Single-channel Michel electron spectra plot saved to {img_path}")
         print(f"Single-channel Michel electron spectra data saved to {pkl_path}")
+        mean_print_caveat = "" if have_true_mean else f" (lower bound; range truncated at {edges[-1]:.0f} p.e./channel)"
+        print(f"Sum of per-channel fitted peaks (modes)  = {peak_sum:.2f} p.e.")
+        print(f"Sum of per-channel {mean_label:<24} = {mean_sum:.2f} p.e.{mean_print_caveat}")
         return channel_payload
 
 class RunProcessor:
@@ -3029,6 +3118,9 @@ class RunProcessor:
         # since a single channel's PE scale is ~1/12 of the summed total_pe scale).
         michel_channel_hist_counts = None
         michel_channel_hist_edges = None
+        michel_channel_sum_pe = None
+        michel_channel_sum_pe2 = None
+        michel_channel_n = 0
         if mu1_values is not None and 'area_array' in sel.columns and not sel.empty:
             channel_pe = self.data_processor.calculate_pe_per_channel(sel, mu1_values)
             channel_edges = np.linspace(
@@ -3039,6 +3131,17 @@ class RunProcessor:
             for ch in range(channel_pe.shape[1]):
                 michel_channel_hist_counts[ch], _ = np.histogram(channel_pe[:, ch], bins=channel_edges)
             michel_channel_hist_edges = channel_edges
+
+            # True per-channel mean/variance sufficient statistics, computed on the
+            # full (untruncated) channel_pe array -- unlike the histogram above,
+            # which is deliberately binned only over MICHEL_CHANNEL_PE_RANGE (e.g.
+            # 0-200 P.E.) for peak visibility and so would silently drop the small
+            # tail of events where a single channel collects an outsized share of
+            # light, biasing a histogram-derived mean low. Sum/sum-of-squares
+            # accumulate exactly across runs/subjobs (unlike a truncated mean).
+            michel_channel_sum_pe = np.sum(channel_pe, axis=0)
+            michel_channel_sum_pe2 = np.sum(channel_pe ** 2, axis=0)
+            michel_channel_n = int(channel_pe.shape[0])
 
         return {
             'delta_t': sel['delta_t'].values,
@@ -3051,6 +3154,9 @@ class RunProcessor:
             'michel_fit': michel_fit,
             'michel_channel_hist_counts': michel_channel_hist_counts,
             'michel_channel_hist_edges': michel_channel_hist_edges,
+            'michel_channel_sum_pe': michel_channel_sum_pe,
+            'michel_channel_sum_pe2': michel_channel_sum_pe2,
+            'michel_channel_n': michel_channel_n,
         }
 
 def main():
@@ -3092,6 +3198,9 @@ def main():
         'total_pe_edges': None,
         'michel_channel_hists': None,
         'michel_channel_edges': None,
+        'michel_channel_sum_pe': None,
+        'michel_channel_sum_pe2': None,
+        'michel_channel_n': 0,
         'event61_hist': None,
         'event61_edges': None,
         'sipm_area_hists': None,
@@ -3177,6 +3286,18 @@ def main():
                                 raise ValueError("Michel single-channel histogram edge mismatch across runs")
                             for ch, counts in michel_ch_counts.items():
                                 aggregated['michel_channel_hists'][ch] += np.asarray(counts, dtype=float)
+
+                    michel_ch_sum_pe = main_hist_payload.get('michel_channel_sum_pe')
+                    michel_ch_sum_pe2 = main_hist_payload.get('michel_channel_sum_pe2')
+                    michel_ch_n = main_hist_payload.get('michel_channel_n')
+                    if michel_ch_sum_pe is not None and michel_ch_sum_pe2 is not None:
+                        if aggregated['michel_channel_sum_pe'] is None:
+                            aggregated['michel_channel_sum_pe'] = np.asarray(michel_ch_sum_pe, dtype=float).copy()
+                            aggregated['michel_channel_sum_pe2'] = np.asarray(michel_ch_sum_pe2, dtype=float).copy()
+                        else:
+                            aggregated['michel_channel_sum_pe'] += np.asarray(michel_ch_sum_pe, dtype=float)
+                            aggregated['michel_channel_sum_pe2'] += np.asarray(michel_ch_sum_pe2, dtype=float)
+                        aggregated['michel_channel_n'] += int(michel_ch_n or 0)
 
                 # Low-light histogram data
                 aggregated['low_light_hists'].append(ll_hists)
@@ -3324,7 +3445,13 @@ def main():
             )
         if aggregated['michel_channel_hists'] is not None and aggregated['michel_channel_edges'] is not None:
             FileHandler.save_pickle(
-                {'counts': aggregated['michel_channel_hists'], 'edges': aggregated['michel_channel_edges']},
+                {
+                    'counts': aggregated['michel_channel_hists'],
+                    'edges': aggregated['michel_channel_edges'],
+                    'sum_pe': aggregated['michel_channel_sum_pe'],
+                    'sum_pe2': aggregated['michel_channel_sum_pe2'],
+                    'n': aggregated['michel_channel_n'],
+                },
                 output_dir / 'aggregated_michel_channel_hists.pkl'
             )
             processor.plotter.plot_michel_spectrum_per_channel(
@@ -3332,7 +3459,10 @@ def main():
                 aggregated['michel_channel_edges'],
                 output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_spectrum_per_channel.png",
                 output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_spectrum_per_channel.pkl",
-                f"Runs {start_run}-{end_run}", M1_or_M2
+                f"Runs {start_run}-{end_run}", M1_or_M2,
+                channel_sum_pe=aggregated['michel_channel_sum_pe'],
+                channel_sum_pe2=aggregated['michel_channel_sum_pe2'],
+                n_events=aggregated['michel_channel_n'],
             )
         if aggregated['event61_hist'] is not None and aggregated['event61_edges'] is not None:
             FileHandler.save_pickle(

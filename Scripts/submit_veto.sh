@@ -16,7 +16,7 @@ end_run=4766
 step=1  # NEW: Process every Nth run
 M1_or_M2="M2"
 njobs=10
-partition="red" # blue red green
+partition="green" # blue red green
 
 # Data Directories
 DATA_BASE_DIR="/raid1/genli/Data_D2O/M1_data"

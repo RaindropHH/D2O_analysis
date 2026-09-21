@@ -1147,6 +1147,9 @@ class MasterAggregator:
         self.michel_channel_bin_edges = None
         self.master_michel_channel_hist_counts = None
         self.michel_channel_data_found = False
+        self.master_michel_channel_sum_pe = None
+        self.master_michel_channel_sum_pe2 = None
+        self.master_michel_channel_n = 0
 
         event61_cfg = get_event61_fit_config()
         self.event61_bin_edges = np.linspace(*event61_cfg['hist_range'], event61_cfg['bins'] + 1)
@@ -1729,6 +1732,22 @@ class MasterAggregator:
                             job_michel_ch_counts.get(ch, 0), dtype=float
                         )
 
+                # Exact (untruncated) per-channel mean sufficient statistics, if
+                # present -- older subjob outputs predating this feature won't
+                # have them, so fall back gracefully to the truncated histogram
+                # mean at plot time (see _generate_main_plots).
+                job_sum_pe = michel_ch_data.get('sum_pe')
+                job_sum_pe2 = michel_ch_data.get('sum_pe2')
+                job_n = michel_ch_data.get('n')
+                if job_sum_pe is not None and job_sum_pe2 is not None:
+                    if self.master_michel_channel_sum_pe is None:
+                        self.master_michel_channel_sum_pe = np.asarray(job_sum_pe, dtype=float).copy()
+                        self.master_michel_channel_sum_pe2 = np.asarray(job_sum_pe2, dtype=float).copy()
+                    else:
+                        self.master_michel_channel_sum_pe += np.asarray(job_sum_pe, dtype=float)
+                        self.master_michel_channel_sum_pe2 += np.asarray(job_sum_pe2, dtype=float)
+                    self.master_michel_channel_n += int(job_n or 0)
+
             except Exception as e:
                 print(f"  Warning: Could not process single-channel Michel data for {sub_dir.name}. Error: {e}")
 
@@ -2042,7 +2061,10 @@ class MasterAggregator:
                 self.michel_channel_bin_edges,
                 self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_spectrum_per_channel.png",
                 self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_spectrum_per_channel.pkl",
-                self.agg_label, self.m1_or_m2
+                self.agg_label, self.m1_or_m2,
+                channel_sum_pe=self.master_michel_channel_sum_pe,
+                channel_sum_pe2=self.master_michel_channel_sum_pe2,
+                n_events=self.master_michel_channel_n,
             )
 
     def _generate_event61_plots(self):
