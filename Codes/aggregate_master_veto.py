@@ -2056,7 +2056,7 @@ class MasterAggregator:
         if (self.michel_channel_data_found and self.master_michel_channel_hist_counts is not None
                 and any(np.sum(c) > 0 for c in self.master_michel_channel_hist_counts.values())):
             print("Aggregating single-PMT-channel Michel electron spectra...")
-            self.plotter.plot_michel_spectrum_per_channel(
+            michel_channel_payload = self.plotter.plot_michel_spectrum_per_channel(
                 self.master_michel_channel_hist_counts,
                 self.michel_channel_bin_edges,
                 self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_spectrum_per_channel.png",
@@ -2066,6 +2066,13 @@ class MasterAggregator:
                 channel_sum_pe2=self.master_michel_channel_sum_pe2,
                 n_events=self.master_michel_channel_n,
             )
+            if michel_channel_payload is not None:
+                self.plotter.plot_michel_channel_summary(
+                    michel_channel_payload,
+                    self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_channel_summary.png",
+                    self.master_output_dir / f"{self.filename_label}_{self.m1_or_m2}_michel_channel_summary.pkl",
+                    self.agg_label, self.m1_or_m2
+                )
 
     def _generate_event61_plots(self):
         """Generate the master Event61 histogram and fit plot."""

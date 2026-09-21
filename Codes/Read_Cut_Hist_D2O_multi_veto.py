@@ -1593,6 +1593,57 @@ class Plotter:
         print(f"Sum of per-channel {mean_label:<24} = {mean_sum:.2f} p.e.{mean_print_caveat}")
         return channel_payload
 
+    def plot_michel_channel_summary(self, channel_payload, img_path, pkl_path, title, M1_or_M2):
+        """Per-channel Michel fit summary: one point per PMT channel (ch00-ch11),
+        y = the FWHM-window Gaussian fit's peak/mean, error bar = the fit's
+        uncertainty on that mean (peak_location_error) -- e.g. 224.63+/-0.28 p.e.
+        is plotted with error bar +/-0.28, not the fit's sigma (peak width).
+
+        Takes the channel_payload dict returned by plot_michel_spectrum_per_channel()
+        (keyed by channel index, each holding a 'michel_fit' dict).
+        """
+        channels = sorted(channel_payload.keys())
+        peaks = np.full(len(channels), np.nan)
+        peak_errs = np.full(len(channels), np.nan)
+        sigmas = np.full(len(channels), np.nan)
+        sigma_errs = np.full(len(channels), np.nan)
+        for i, ch in enumerate(channels):
+            fit = channel_payload[ch].get('michel_fit', {})
+            if fit.get('success'):
+                peaks[i] = fit['peak_location']
+                peak_errs[i] = fit['peak_location_error']
+                sigmas[i] = fit['sigma']
+                sigma_errs[i] = fit['sigma_error']
+
+        plt.figure(figsize=(9, 6))
+        plt.errorbar(
+            channels, peaks, yerr=peak_errs, fmt='o', markersize=7, capsize=5,
+            color='tab:blue', ecolor='tab:blue', elinewidth=1.5, capthick=1.5,
+            label=r'fit peak (mean) $\mu \pm$ error on the mean'
+        )
+        plt.xlabel('PMT channel')
+        plt.ylabel('Michel fit peak / mean (P.E.)')
+        plt.title(f'Per-Channel Michel Fit Summary: {title} ({M1_or_M2})')
+        plt.xticks(channels, [f'ch{ch:02d}' for ch in channels])
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        self.file_handler.ensure_dir(img_path.parent)
+        plt.savefig(img_path)
+        plt.close()
+
+        payload = {
+            'channel': np.asarray(channels),
+            'peak_location': peaks,
+            'peak_location_error': peak_errs,
+            'sigma': sigmas,
+            'sigma_error': sigma_errs,
+        }
+        self.file_handler.save_pickle(payload, pkl_path)
+        print(f"Per-channel Michel fit summary plot saved to {img_path}")
+        print(f"Per-channel Michel fit summary data saved to {pkl_path}")
+        return payload
+
 class RunProcessor:
     """Main class for processing individual runs."""
     
@@ -3454,7 +3505,7 @@ def main():
                 },
                 output_dir / 'aggregated_michel_channel_hists.pkl'
             )
-            processor.plotter.plot_michel_spectrum_per_channel(
+            michel_channel_payload = processor.plotter.plot_michel_spectrum_per_channel(
                 aggregated['michel_channel_hists'],
                 aggregated['michel_channel_edges'],
                 output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_spectrum_per_channel.png",
@@ -3464,6 +3515,13 @@ def main():
                 channel_sum_pe2=aggregated['michel_channel_sum_pe2'],
                 n_events=aggregated['michel_channel_n'],
             )
+            if michel_channel_payload is not None:
+                processor.plotter.plot_michel_channel_summary(
+                    michel_channel_payload,
+                    output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_channel_summary.png",
+                    output_dir / f"subjob_{start_run}-{end_run}_{M1_or_M2}_michel_channel_summary.pkl",
+                    f"Runs {start_run}-{end_run}", M1_or_M2
+                )
         if aggregated['event61_hist'] is not None and aggregated['event61_edges'] is not None:
             FileHandler.save_pickle(
                 {'counts': aggregated['event61_hist'], 'edges': aggregated['event61_edges']},
