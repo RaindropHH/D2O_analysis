@@ -1594,10 +1594,13 @@ class Plotter:
         return channel_payload
 
     def plot_michel_channel_summary(self, channel_payload, img_path, pkl_path, title, M1_or_M2):
-        """Per-channel Michel fit summary: one point per PMT channel (ch00-ch11),
-        y = the FWHM-window Gaussian fit's peak/mean, error bar = the fit's
-        uncertainty on that mean (peak_location_error) -- e.g. 224.63+/-0.28 p.e.
-        is plotted with error bar +/-0.28, not the fit's sigma (peak width).
+        """Per-channel Michel fit summary: one point per PMT channel (ch00-ch11).
+
+        Left y-axis: the FWHM-window Gaussian fit's peak/mean, error bar = the
+        fit's uncertainty on that mean (peak_location_error) -- e.g.
+        224.63+/-0.28 p.e. is plotted with error bar +/-0.28.
+        Right y-axis: the fit's sigma (peak width), error bar = the fit's
+        uncertainty on sigma (sigma_error).
 
         Takes the channel_payload dict returned by plot_michel_spectrum_per_channel()
         (keyed by channel index, each holding a 'michel_fit' dict).
@@ -1615,22 +1618,34 @@ class Plotter:
                 sigmas[i] = fit['sigma']
                 sigma_errs[i] = fit['sigma_error']
 
-        plt.figure(figsize=(9, 6))
-        plt.errorbar(
+        fig, ax_mean = plt.subplots(figsize=(9, 6))
+        mean_handle = ax_mean.errorbar(
             channels, peaks, yerr=peak_errs, fmt='o', markersize=7, capsize=5,
             color='tab:blue', ecolor='tab:blue', elinewidth=1.5, capthick=1.5,
             label=r'fit peak (mean) $\mu \pm$ error on the mean'
         )
-        plt.xlabel('PMT channel')
-        plt.ylabel('Michel fit peak / mean (P.E.)')
-        plt.title(f'Per-Channel Michel Fit Summary: {title} ({M1_or_M2})')
-        plt.xticks(channels, [f'ch{ch:02d}' for ch in channels])
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
+        ax_mean.set_xlabel('PMT channel')
+        ax_mean.set_ylabel('Michel fit peak / mean (P.E.)', color='tab:blue')
+        ax_mean.tick_params(axis='y', labelcolor='tab:blue')
+        ax_mean.set_xticks(channels)
+        ax_mean.set_xticklabels([f'ch{ch:02d}' for ch in channels])
+        ax_mean.grid(True, alpha=0.3)
+
+        ax_sigma = ax_mean.twinx()
+        sigma_handle = ax_sigma.errorbar(
+            channels, sigmas, yerr=sigma_errs, fmt='s', markersize=7, capsize=5,
+            color='tab:red', ecolor='tab:red', elinewidth=1.5, capthick=1.5,
+            label=r'fit $\sigma \pm$ error on $\sigma$'
+        )
+        ax_sigma.set_ylabel('Michel fit sigma (P.E.)', color='tab:red')
+        ax_sigma.tick_params(axis='y', labelcolor='tab:red')
+
+        ax_mean.set_title(f'Per-Channel Michel Fit Summary: {title} ({M1_or_M2})')
+        ax_mean.legend(handles=[mean_handle, sigma_handle], loc='best')
+        fig.tight_layout()
         self.file_handler.ensure_dir(img_path.parent)
-        plt.savefig(img_path)
-        plt.close()
+        fig.savefig(img_path)
+        plt.close(fig)
 
         payload = {
             'channel': np.asarray(channels),
